@@ -1,0 +1,45 @@
+// Pop signing configuration.
+//
+// THE ONE FILE that decides the app's code identity. It exists so that
+// switching identity is a one-line edit rather than a hunt through project
+// settings: Xcode → Settings → Accounts → Manage Certificates is where
+// certificates live, and this file is where Pop picks one.
+
+// The identity Pop signs with today. `PopDev` is a stable self-signed
+// codesigning certificate in the login keychain (created 2026-10: 10-year,
+// Code Signing EKU) — stable on purpose: Keychain ACLs bind to the code
+// signature, and an identity that never changes means the user grants
+// keychain access exactly once, not once per rebuild. `POP_SIGN_IDENTITY`
+// env still overrides, e.g. `POP_SIGN_IDENTITY=GlanceDev ./Scripts/bundle_app.sh`.
+//
+// TO SHIP: once a "Developer ID Application" certificate exists in
+// Xcode → Settings → Accounts → Manage Certificates, changing ONLY the next
+// line to `Developer ID Application` is the entire edit required for a
+// distributable, notarizable build.
+POP_SIGN_IDENTITY = PopDev
+
+// Xcode refuses to combine automatic signing with a named identity
+// ("Pop is automatically signed, but code signing identity GlanceDev has been
+// manually specified"), and automatic signing on a free Personal Team cannot
+// produce a stable, portable identity anyway — the identity changes with the
+// signed-in account, which is exactly the Keychain/TCC drift this file exists
+// to stop.
+//
+// Manual signing is therefore the combination that both BUILDS and gives a
+// stable code identity, and it still leaves the identity under Xcode's control:
+// it is chosen in Signing & Capabilities and set in ONE line below.
+CODE_SIGN_STYLE = Manual
+CODE_SIGN_IDENTITY = $(POP_SIGN_IDENTITY)
+
+// Intentionally EMPTY. Manual signing with a named identity needs no team, and
+// naming one would make Xcode reject a self-signed certificate ("No certificate
+// for team '...' matching 'GlanceDev' found"). Xcode fills the team itself once
+// POP_SIGN_IDENTITY above is a real team certificate such as
+// "Developer ID Application".
+DEVELOPMENT_TEAM =
+
+// Pop is an accessory app that drives other applications and reads system
+// state, so the hardened runtime is required for a notarized build. It is not
+// sandboxed and must not be.
+ENABLE_HARDENED_RUNTIME = YES
+CODE_SIGN_ENTITLEMENTS = Config/Pop.entitlements

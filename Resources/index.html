@@ -1,0 +1,1946 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Pop</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    /* The panel window is transparent so the launcher floats over the desktop;
+       the visible surface is only the composer bar (and, when a chat is
+       running, the transcript backdrop above it). */
+    html, body {
+      margin: 0; height: 100%;
+      background: transparent; color: #e9eaf0;
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    }
+    body {
+      display: flex; flex-direction: column;
+      padding: 0; overflow: hidden;
+      position: relative;
+    }
+    header { display: none; }
+    h1 { margin: 0; font-size: 19px; letter-spacing: -0.01em; }
+    #status { display: none; }
+    #status.ok { color: #59d18c; }
+
+    /* THE TRANSCRIPT IS A SCROLLING CONVERSATION. `#bubble` stays the one
+       scroll container and keeps its id (every existing probe and the panel
+       state layer address it by name); what changed is the CONTENT: one block
+       per turn instead of one question + one answer. User turns are compact
+       right-aligned pills, assistant turns are full-width prose.
+       NO `max-height`: a cap left the panel's extra height as a DEAD BAND between
+       the transcript and the composer. The region FLEXES to fill the column, so
+       the status line sits directly above the composer in every state. */
+    #bubble {
+      flex: 1 1 auto; min-height: 0;
+      margin: 8px 10px 0; padding: 10px 12px;
+      overflow-y: auto;
+      /* THE GLASS. These five declarations used to sit AFTER a closed rule \u2014 an
+         orphaned block with a stray `}` \u2014 which cost `#bubble` its background,
+         border, radius and blur. The transcript then rendered light text straight
+         onto the desktop: the reply was there, and on a light wallpaper it read as
+         a blank panel. A stylesheet is not a place to be casual about braces. */
+      background: rgba(22, 24, 32, 0.82);
+      border: 1px solid rgba(90, 96, 118, 0.35);
+      border-radius: 18px;
+      backdrop-filter: blur(18px) saturate(140%);
+      -webkit-backdrop-filter: blur(18px) saturate(140%);
+      /* A styled, VISIBLE scrollbar. The defect this milestone fixes was a
+         reply that was rendered but unreachable: content clipped into a slot
+         whose scrollbar was invisible. Content no scrollbar cues at all is the
+         same failure with better manners. */
+      scrollbar-width: thin; scrollbar-color: #4f7dff rgba(0, 0, 0, 0.4);
+    }
+    #bubble::-webkit-scrollbar { width: 10px; }
+    #bubble::-webkit-scrollbar-track { background: rgba(0, 0, 0, 0.4); border-radius: 8px; }
+    #bubble::-webkit-scrollbar-thumb {
+      background: #4f7dff; border-radius: 8px; border: 2px solid rgba(0, 0, 0, 0.4);
+    }
+    #bubble::-webkit-scrollbar-thumb:hover { background: #79a6ff; }
+    /* Bar state shows ONLY the composer: robot + bar, no transcript at all.
+       Swift's state is the authority, so `body.launcher` forces it hidden
+       regardless of content — the DEFAULT VIEW STAYS ROBOT-ONLY. */
+    body.launcher #bubble,
+    body.chat-empty #bubble { display: none !important; }
+
+    /* BROWSER BAND. Hidden entirely until a browser tool opens a page, so the
+       launcher geometry is byte-identical to a Pop with no browser. */
+    #browserSpacer { flex: none; height: 0; }
+    body.browser-open #browserSpacer { height: 300px; }
+
+    /* The conversation collapses to ONE line while the browser is up: the point
+       is that the browser is visible while tools act AND the user can still see
+       what is being said. Tapping expands the transcript again. */
+    #browserStrip {
+      display: none; flex: none; margin: 8px 10px 0; padding: 5px 10px;
+      border-radius: 12px;
+      background: rgba(22, 24, 32, 0.82);
+      border: 1px solid rgba(90, 96, 118, 0.35);
+      font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: #9aa2b8; white-space: nowrap; overflow: hidden;
+      text-overflow: ellipsis; cursor: pointer;
+    }
+    #browserStrip:hover { color: #cfd4e4; }
+    #browserStrip:focus-visible { outline: 2px solid #79a6ff; outline-offset: 2px; }
+    #browserStrip .bs-url { color: #79a6ff; }
+    #browserStrip .bs-status { color: #f0c987; }
+    body.browser-open #browserStrip { display: block; }
+    /* BROWSER-OPEN: THE PANE AND THE CONVERSATION SHARE THE HEIGHT, AND THE
+       TRANSCRIPT IS READABLE.
+       This used to collapse the transcript to 44pt and expand it to 128pt,
+       `overflow: hidden` in the first case. A finished answer was rendered into
+       that slot and simply was not on screen \u2014 "no answer display by pop",
+       with every DOM probe green, because presence in the DOM is not presence on
+       screen. The transcript now takes whatever height the pane leaves it and
+       scrolls with a visible scrollbar; `browser-expanded` is kept as the
+       strip's acknowledgement that the conversation has been opened (it no
+       longer gates a clip, and the `.turn` elements are never removed, so every
+       probe that counts turns keeps counting the same things). */
+    body.browser-open #bubble,
+    body.browser-open.browser-expanded #bubble {
+      max-height: none; overflow-y: auto;
+    }
+    body.browser-open.browser-expanded #browserStrip {
+      box-shadow: inset 0 0 0 1px rgba(121, 166, 255, 0.5);
+    }
+
+    /* One turn. `.turn` is what the UI probe counts; role is a class so CSS
+       can restyle a role without the page knowing the markup. */
+    #bubble .turn { margin: 0 0 10px; }
+    #bubble .turn:last-child { margin-bottom: 2px; }
+    #bubble .turn.user {
+      display: flex; justify-content: flex-end;
+    }
+    #bubble .turn.user .bubble-pill {
+      max-width: 82%;
+      padding: 6px 11px;
+      background: rgba(79, 125, 255, 0.22);
+      border: 1px solid rgba(79, 125, 255, 0.4);
+      border-radius: 16px 16px 4px 16px;
+      color: #e6ebff; font-size: 13px;
+      white-space: pre-wrap; word-break: break-word;
+    }
+    /* Tool activity: one compact line per call, sitting between the question
+       and the answer. Deliberately NOT a `.turn` — a tool is not something
+       the user said, and the turn count that the probes assert is about the
+       conversation only. */
+    #bubble .tool-line {
+      margin: 0 0 8px; padding: 3px 9px;
+      background: rgba(20, 22, 30, 0.6);
+      border: 1px solid rgba(90, 96, 118, 0.3);
+      border-radius: 8px;
+      font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: #9aa2b8; word-break: break-word;
+    }
+    #bubble .tool-line.error { color: #f0a49c; border-color: rgba(240, 164, 156, 0.4); }
+
+    /* THE PLAN: the user's window into work in progress. Same compact
+       monospace voice as a tool line (it is the same "Pop is working"
+       register), but its own block so an update REWRITES the steps instead of
+       appending another copy. Deliberately not a `.turn`: the plan is not
+       something the user said. */
+    #bubble .plan-block {
+      margin: 0 0 8px; padding: 4px 9px;
+      background: rgba(20, 22, 30, 0.6);
+      border: 1px solid rgba(90, 96, 118, 0.3);
+      border-radius: 8px;
+      font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: #9aa2b8; word-break: break-word;
+    }
+    #bubble .plan-block .plan-step.running { color: #cfd8f0; }
+    #bubble .plan-block .plan-step.done { color: #8fbf8f; }
+    #bubble .plan-block .plan-step.blocked { color: #f0a49c; }
+
+    /* APPROVAL CARD: the one-click gate in front of a mutating tool. Real
+       <button>s so Enter/Space work without any key handler of our own, and so
+       VoiceOver sees three buttons rather than one clickable div. */
+    #bubble .approval-card {
+      margin: 0 0 10px; padding: 9px 11px;
+      background: rgba(30, 26, 18, 0.72);
+      border: 1px solid rgba(226, 178, 92, 0.45);
+      border-radius: 10px;
+    }
+    #bubble .approval-card.resolved { opacity: 0.72; border-color: rgba(90, 96, 118, 0.3); }
+    #bubble .approval-card .ac-head {
+      display: flex; align-items: center; gap: 6px; margin-bottom: 5px;
+      font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    #bubble .approval-card .ac-tool { color: #f0c987; font-weight: 600; }
+    #bubble .approval-card .ac-risk {
+      padding: 1px 6px; border-radius: 5px;
+      background: rgba(226, 178, 92, 0.18); color: #f0c987;
+      font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase;
+    }
+    #bubble .approval-card .ac-preview {
+      margin: 0 0 8px; color: #9aa2b8;
+      font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+      word-break: break-word; white-space: pre-wrap;
+    }
+    /* jev is an ADVISORY label only: it never gates the decision, so it reads as
+       quiet secondary text, not a control. */
+    #bubble .approval-card .ac-jev {
+      margin: 0 0 8px; color: #8fb6d1;
+      font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: 0.01em;
+    }
+    /* The typed-text card shows the EXACT text in a read-friendly block. */
+    #bubble .approval-card .ac-summary { margin: 0 0 6px; color: #cfd4e2; font-size: 12px; }
+    #bubble .approval-card .ac-text {
+      margin: 0 0 8px; padding: 6px 8px; border-radius: 7px;
+      background: #101118; color: #eef0f6;
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: pre-wrap; word-break: break-word;
+      border: 1px solid rgba(120, 128, 150, 0.45);
+    }
+    #bubble .approval-card .ac-target { margin: 0 0 8px; color: #9aa2b8; font-size: 11px; }
+    #bubble .approval-card .ac-actions { display: flex; gap: 6px; }
+    #bubble .approval-card button {
+      font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+      padding: 5px 10px; border-radius: 7px; cursor: pointer;
+      border: 1px solid rgba(120, 128, 150, 0.45);
+      background: rgba(40, 44, 56, 0.9); color: #dfe2ec;
+    }
+    #bubble .approval-card button.ac-run { border-color: rgba(126, 214, 150, 0.55); color: #b6ecce; }
+    #bubble .approval-card button.ac-deny { border-color: rgba(240, 164, 156, 0.55); color: #f0b8b0; }
+    /* Focus must be visible: these are the only controls on the panel that
+       block what happens next, so keyboard users need to see where they are. */
+    #bubble .approval-card button:focus-visible {
+      outline: 2px solid #79a6ff; outline-offset: 2px;
+    }
+    #bubble .approval-card .ac-edit { margin-bottom: 8px; }
+    #bubble .approval-card .ac-edit textarea {
+      width: 100%; box-sizing: border-box; min-height: 74px; resize: vertical;
+      padding: 6px 8px; border-radius: 7px;
+      border: 1px solid rgba(120, 128, 150, 0.5);
+      background: #101118; color: #dfe2ec;
+      font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    #bubble .approval-card .ac-note {
+      margin-top: 7px; color: #7c8296; font-size: 11px;
+    }
+    #bubble .turn.assistant .answer {
+      display: block; color: #dfe2ec; word-break: break-word;
+    }
+    #bubble.error .answer { color: #f0a49c; }
+    /* The receipt a stopped turn leaves behind. A cancelled request must still
+       show what happened to it: an empty assistant block reads as "Pop dropped
+       my question", which is the failure this milestone closes. */
+    #bubble .stopped-note {
+      display: block; margin-top: 6px; color: #f0c987;
+      font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    #bubble code, #bubble pre {
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    #bubble code { padding: 1px 4px; background: #1c1e25; border-radius: 5px; }
+    #bubble pre {
+      margin: 6px 0 0; padding: 8px 10px; overflow-x: auto;
+      background: #101118; border: 1px solid #262a34; border-radius: 8px;
+    }
+    #bubble pre code { padding: 0; background: none; }
+    #bubble strong { font-weight: 700; }
+    #bubble em { font-style: italic; }
+
+    .codeblock { margin: 6px 0 0; border: 1px solid #262a34; border-radius: 8px; overflow: hidden; }
+    .codehead {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 3px 8px; background: #1a1c25; border-bottom: 1px solid #262a34;
+      font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: #7c8296;
+    }
+    .codehead button {
+      background: none; border: 0; padding: 0 4px; cursor: pointer;
+      color: #9aa2b8; font: inherit; text-transform: none; letter-spacing: 0;
+    }
+    .codehead button:hover { color: #fff; }
+    .codeblock pre { margin: 0; border: 0; border-radius: 0; }
+
+    #caret {
+      display: inline-block; width: 7px; color: #6f8cff;
+      animation: blink 1s steps(2, start) infinite; vertical-align: -1px;
+    }
+    @keyframes blink { to { visibility: hidden; } }
+
+    .actions { display: flex; gap: 6px; margin-top: 4px; opacity: 0; transition: opacity 0.12s; }
+    #bubble:hover .actions { opacity: 1; }
+    .actions button {
+      background: none; border: 1px solid #2c313d; border-radius: 6px;
+      padding: 1px 7px; font-size: 11px; color: #8b8f9e; cursor: pointer;
+    }
+    .actions button:hover { color: #fff; border-color: #4f7dff; }
+
+    /* THE STREAM STATUS LINE. While a reply is coming in the panel used to be
+       silent: an empty assistant block, no elapsed time, and no way to tell a
+       slow answer from a dead one. This line carries the state the transcript
+       cannot, so it lives ABOVE the composer \u2014 the bar itself never moves.
+       `display: none` when it holds nothing, so an idle Pop has byte-identical
+       geometry to one that never streamed. */
+    #streamStatus {
+      flex: none; display: none;
+      margin: 6px 14px 0; padding: 3px 10px;
+      background: rgba(22, 24, 32, 0.82);
+      border: 1px solid rgba(90, 96, 118, 0.35);
+      border-radius: 10px;
+      font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: #9aa2b8; white-space: nowrap; overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #streamStatus.on { display: block; }
+    #streamStatus.thinking { color: #79a6ff; }
+    #streamStatus.ready { color: #59d18c; }
+    #streamStatus.stopped { color: #f0c987; }
+    #streamStatus.error { color: #f0a49c; }
+
+    /* The composer bar: one long translucent capsule. It sits DIRECTLY under the
+       status line (no top margin) so no dead band can open between them — the
+       transcript region above absorbs the slack. The actor that must NOT regress
+       is the voice dialog: WHEN THE TRANSCRIPT IS HIDDEN (`launcher`/`chat-empty`)
+       the flex column has no grower, so the composer is pinned to the bottom by
+       its own auto top margin (rule below), keeping the absolutely-positioned
+       #voiceDlg/#menu on screen above it. */
+    #composer {
+      position: relative; flex: none;
+      display: flex; align-items: center; gap: 8px;
+      margin: 0 10px 10px; padding: 8px 8px 8px 10px;
+      background: rgba(24, 26, 34, 0.86);
+      border: 1px solid rgba(96, 102, 124, 0.45);
+      border-radius: 9999px;
+      backdrop-filter: blur(22px) saturate(150%);
+      -webkit-backdrop-filter: blur(22px) saturate(150%);
+    }
+    /* Pin to the bottom ONLY when there is no transcript region to grow: in the
+       launcher/empty states `#bubble` is `display:none`, so without this the
+       composer would float to the top and the voice dialog would go off-screen. */
+    body.launcher #composer,
+    body.chat-empty #composer { margin-top: auto; }
+
+    /* `+` menu button. */
+    #plus {
+      flex: none; width: 28px; height: 28px; padding: 0;
+      border-radius: 50%; border: 1px solid rgba(96, 102, 124, 0.5);
+      background: #2c313d; color: #b6bccd;
+      font-size: 15px; line-height: 1; cursor: pointer;
+    }
+    #plus:hover, #plus[aria-expanded="true"] { background: #4f7dff; color: #fff; border-color: #4f7dff; }
+
+    /* Microphone button: opens voice input. Sits between `+` and the field.
+       `.active` is driven ONLY by Swift's `voiceState` push, so the button can
+       never disagree with the mascot about whether the mic is open. */
+    #mic {
+      flex: none; width: 28px; height: 28px; padding: 0;
+      border-radius: 50%; border: 1px solid rgba(96, 102, 124, 0.5);
+      background: #2c313d; color: #b6bccd;
+      font-size: 13px; line-height: 1; cursor: pointer;
+    }
+    #mic:hover { background: #4f7dff; color: #fff; border-color: #4f7dff; }
+    #mic.active { background: #4f7dff; color: #fff; border-color: #4f7dff; }
+    #mic.active:hover { background: #3f6de6; }
+
+    /* THE VOICE DIALOG: the surface a spoken turn lives on. Pop listens (mic ON)
+       with the live transcript on show; when listening stops the same dialog
+       parks in send-ready and the Send button appears — the transcript only
+       ever submits when the user presses Send. It floats above the composer bar
+       using the same translucent-panel vocabulary as `#menu`. It is a sibling of
+       `#composer` (not a child) so the voice-only surface can hide the composer
+       without hiding the dialog; `bottom` is the composer's height (46px) plus
+       its 10px bottom margin plus the 8px gap. */
+    #voiceDlg {
+      position: absolute; bottom: 64px; left: 6px; right: 6px;
+      padding: 10px 12px 12px;
+      background: rgba(24, 26, 34, 0.94);
+      border: 1px solid rgba(96, 102, 124, 0.5);
+      border-radius: 14px;
+      backdrop-filter: blur(22px) saturate(150%);
+      -webkit-backdrop-filter: blur(22px) saturate(150%);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+      z-index: 25;
+    }
+    #voiceDlg[hidden] { display: none; }
+
+    /* VOICE-ONLY SURFACE: a listen started from the mascot reveals the web view
+       for the transcript bubble ALONE. The composer bar and the transcript are
+       hidden, and the dialog drops to the bottom with a small margin. A light
+       entry point must not inherit a heavier UI than it needs. */
+    body.voiceOnly #composer { display: none; }
+    body.voiceOnly #bubble,
+    body.voiceOnly #streamStatus,
+    body.voiceOnly #browserStrip { display: none !important; }
+    body.voiceOnly #voiceDlg { bottom: 8px; }
+    .voice-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+    #voiceLabel {
+      flex: 1; font-size: 10px; letter-spacing: 0.06em;
+      text-transform: uppercase; color: #7c8296;
+    }
+    #voiceClose {
+      flex: none; width: 20px; height: 20px; padding: 0; border: 0;
+      border-radius: 50%; background: none; color: #8b8f9e;
+      font: inherit; line-height: 1; cursor: pointer;
+    }
+    #voiceClose:hover { background: #2c313d; color: #dfe2ec; }
+    #voiceText {
+      min-height: 18px; max-height: 120px; overflow-y: auto;
+      font-size: 13px; line-height: 1.4; color: #dfe2ec;
+      white-space: pre-wrap; word-break: break-word;
+    }
+    #voiceText:empty::before { content: "Speak \2014 Pop is listening\2026"; color: #6d7386; }
+    .voice-foot { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+    #voiceMic {
+      flex: none; width: 28px; height: 28px; padding: 0;
+      border-radius: 50%; border: 1px solid rgba(96, 102, 124, 0.5);
+      background: #2c313d; color: #b6bccd;
+      font-size: 13px; line-height: 1; cursor: pointer;
+    }
+    #voiceMic:hover { background: #4f7dff; color: #fff; border-color: #4f7dff; }
+    #voiceMic.active { background: #4f7dff; color: #fff; border-color: #4f7dff; }
+    #voiceSend {
+      margin-left: auto; padding: 5px 14px; border: 0; border-radius: 9999px;
+      background: #4f7dff; color: #fff; font: inherit; font-size: 12px; cursor: pointer;
+    }
+    #voiceSend:hover { background: #3f6de6; }
+    #voiceSend[disabled] { background: #2c313d; color: #6d7386; cursor: default; }
+    #voiceSend[hidden] { display: none; }
+
+    input[type="text"] {
+      flex: 1; min-width: 0; padding: 4px 2px; background: none;
+      border: 0; color: inherit; font: inherit; outline: none; resize: none;
+    }
+    #send, #stop {
+      flex: none; width: 28px; height: 28px; padding: 0; border-radius: 50%;
+      border: 0; background: #2c313d; color: #6d7386;
+      font-size: 12px; line-height: 1; cursor: pointer;
+    }
+    #send.active { background: #4f7dff; color: #fff; }
+    #send.stop { background: #e0574a; color: #fff; }
+    /* THE STOP CONTROL MUST NOT LOOK LIKE "send". A misclick on it is the
+       whole defect: it used to cancel an in-flight request with no receipt and
+       no feedback. Square glyph, warm colour, explicit label. */
+    #stop { background: #e0574a; color: #fff; font-size: 11px; }
+    #stop:hover { background: #c9453a; }
+    #stop:focus-visible { outline: 2px solid #f0c987; outline-offset: 2px; }
+    #send[hidden], #stop[hidden] { display: none; }
+
+    /* The `+` popover: context toggles and the privacy row live in here now,
+       so the default bar shows nothing but the placeholder and the send arrow.
+       CAPPED so it always fits the space the panel can give: a long session list
+       must SCROLL inside the popover, never grow the popover off the window top.
+       The panel's max web region is 300pt (`PanelController.handleContentHeight`),
+       and the popover's bottom sits ~64pt above the window bottom, so a 224pt cap
+       always leaves the top edge on screen. A `100%`-based cap would resolve
+       against `#composer` (~47pt), not the viewport, so the cap is a constant. */
+    #menu {
+      position: absolute; bottom: calc(100% + 8px); left: 6px;
+      min-width: 236px; max-width: 300px; padding: 6px;
+      max-height: 224px;
+      background: rgba(24, 26, 34, 0.94);
+      border: 1px solid rgba(96, 102, 124, 0.5);
+      border-radius: 14px;
+      backdrop-filter: blur(22px) saturate(150%);
+      -webkit-backdrop-filter: blur(22px) saturate(150%);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+      display: none; z-index: 20;
+    }
+    /* Flex column so ONLY the session list flexes/shrinks; every other row stays
+       at its natural height. */
+    #menu.open { display: flex; flex-direction: column; }
+    #menu > * { flex: none; }
+    .menu-item {
+      display: flex; align-items: center; gap: 8px; width: 100%;
+      padding: 6px 9px; border: 0; border-radius: 9px;
+      background: none; color: #dfe2ec; font: inherit; text-align: left;
+      cursor: pointer;
+    }
+    .menu-item:hover { background: #2c313d; }
+    .menu-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .menu-check { flex: none; width: 14px; text-align: center; color: #59d18c; }
+    .menu-sep { height: 1px; margin: 5px 4px; background: #2c313d; }
+    /* Conversations: a heading plus one clickable row per past session. */
+    #sessions .menu-head {
+      padding: 4px 9px 2px; font-size: 10px; letter-spacing: 0.06em;
+      text-transform: uppercase; color: #7c8296;
+    }
+    #sessions .session-row {
+      display: flex; align-items: center; gap: 8px; width: 100%;
+      padding: 5px 9px; border: 0; border-radius: 9px;
+      background: none; color: #dfe2ec; font: inherit; text-align: left;
+      cursor: pointer;
+    }
+    #sessions .session-row:hover { background: #2c313d; }
+    #sessions .session-row.current { background: rgba(79, 125, 255, 0.16); }
+    #sessions .session-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #sessions .session-time { flex: none; font-size: 10px; color: #7c8296; }
+    #sessions .empty { padding: 4px 9px 6px; font-size: 11px; color: #6d7386; }
+    /* The Conversations list is the popover's ONE flexible, scrolling region:
+       extra sessions scroll here instead of pushing the popover off-screen.
+       `min-height: 0` lets it shrink below its content so the flex cap bites. */
+    #sessions { flex: 0 1 auto; min-height: 0; overflow-y: auto; }
+
+    /* Context toggles reuse `#chips` so the existing probe selector still
+       reports how many context pieces are attached. */
+    #chips { display: block; }
+    #chips .chip { display: flex; }
+    .chip {
+      width: 100%; align-items: center; gap: 8px; min-width: 0;
+      padding: 6px 9px; border: 0; border-radius: 9px;
+      background: none; color: #dfe2ec; font: inherit; text-align: left;
+      cursor: pointer;
+    }
+    .chip:hover { background: #2c313d; }
+    .chip .shot { width: 30px; height: 18px; object-fit: cover; border-radius: 3px; flex: none; }
+    .chip .state { flex: none; width: 14px; text-align: center; color: #59d18c; }
+    .chip.off .state { color: #6d7386; }
+
+    #privacy {
+      display: flex; align-items: center; gap: 6px; flex: 1;
+      padding: 6px 9px; font-size: 11px; color: #8b8f9e;
+    }
+    #privacy .dot { width: 7px; height: 7px; border-radius: 50%; background: #59d18c; flex: none; }
+    #privacy.cloud .dot { background: #5aa9ff; }
+  </style>
+</head>
+  <body class="launcher chat-empty">
+  <header>
+    <h1>Pop</h1>
+    <span id="status">connecting&hellip;</span>
+  </header>
+
+  <!-- The band the native browser pane occupies. It is a SPACER, not a frame:
+       the browser is a real WKWebView over this area, and reserving the space
+       here is what keeps the conversation readable underneath it. -->
+  <div id="browserSpacer"></div>
+  <div id="browserStrip" role="button" tabindex="0"
+       title="Show the whole conversation">offline &mdash; no page</div>
+
+  <div id="bubble"></div>
+
+  <!-- Scroll affordance for the transcript. An overlay, so it never takes height
+       away from the conversation; shown only when there is actually more below
+       the fold, which is the case the old 44pt/128pt clip made invisible. -->
+
+  <!-- The streaming status line: "Thinking… 1.2s" for as long as the reply is
+       coming in, then the final state (ready / stopped / error). It sits ABOVE
+       the composer so the bar never moves, and it holds nothing \u2014 so it takes
+       no space \u2014 until a turn actually starts. -->
+  <div id="streamStatus" role="status" aria-live="polite"></div>
+
+  <form id="composer">
+    <button id="plus" type="button" title="New chat and context" aria-expanded="false">+</button>
+    <!-- Voice input. `type="button"` so it never submits the form; its only
+         message is `voiceToggle`, and Swift answers with `voiceState`. -->
+    <button id="mic" type="button" title="Talk to Pop" aria-label="Talk to Pop">&#127908;</button>
+    <input id="input" type="text" autocomplete="off" />
+    <button id="send" type="submit" title="Send">&uarr;</button>
+    <!-- While streaming the send control is this one: a square, warm-coloured
+         stop button with an explicit label, so stopping is a DECISION and not a
+         second click on "send". `type="button"` because it must not submit the
+         form \u2014 the form submit path is send-or-nothing, never a cancel. -->
+    <button id="stop" type="button" title="Stop" aria-label="Stop generating" hidden>&#9632;</button>
+    <!-- Shown while a mutating tool waits on a click. Inside the composer form
+         so it sits with the input it disables, and `hidden` rather than a CSS
+         class so it cannot be left visible by a stale stylesheet. -->
+    <span id="approvalNote" hidden>waiting for approval</span>
+
+    <div id="menu">
+      <div id="sessions"></div>
+      <button class="menu-item" type="button" id="menuNewChat">
+        <span class="menu-check"></span><span class="menu-label">New chat</span>
+      </button>
+      <div class="menu-sep"></div>
+      <div id="chips"></div>
+      <div class="menu-sep"></div>
+      <span id="privacy" title="Where this conversation runs"><i class="dot"></i><span id="privacyLabel"></span></span>
+    </div>
+
+    <!-- The voice dialog lives OUTSIDE `#composer` (just below) so the
+         voice-only surface can hide the composer WITHOUT hiding the dialog. It
+         is the ONLY place voice text appears, and nothing in it auto-sends;
+         `#input` stays a pure typing surface. -->
+  </form>
+
+  <div id="voiceDlg" hidden role="dialog" aria-label="Voice input">
+    <div class="voice-head">
+      <span id="voiceLabel">Listening&hellip;</span>
+      <button id="voiceClose" type="button" title="Cancel" aria-label="Cancel voice input">&#215;</button>
+    </div>
+    <div id="voiceText" role="status" aria-live="polite"></div>
+    <div class="voice-foot">
+      <button id="voiceMic" type="button" title="Stop listening" aria-label="Toggle listening">&#127908;</button>
+      <button id="voiceSend" type="button" title="Send" aria-label="Send transcript" hidden>Send</button>
+    </div>
+  </div>
+
+  <script>
+    window.__POP_COMPOSER_V = "spike-u";
+    (function () {
+      var statusEl = document.getElementById("status");
+      var bubbleEl = document.getElementById("bubble");
+      var inputEl = document.getElementById("input");
+      var sendEl = document.getElementById("send");
+      var stopEl = document.getElementById("stop");
+      var chipsEl = document.getElementById("chips");
+      var plusEl = document.getElementById("plus");
+      var micEl = document.getElementById("mic");
+      var voiceDlgEl = document.getElementById("voiceDlg");
+      var voiceTextEl = document.getElementById("voiceText");
+      var voiceMicEl = document.getElementById("voiceMic");
+      var voiceSendEl = document.getElementById("voiceSend");
+      var voiceCloseEl = document.getElementById("voiceClose");
+      var voiceLabelEl = document.getElementById("voiceLabel");
+      var approvalNoteEl = document.getElementById("approvalNote");
+      var menuEl = document.getElementById("menu");
+      var sessionsEl = document.getElementById("sessions");
+      var privacyEl = document.getElementById("privacy");
+      var privacyLabel = document.getElementById("privacyLabel");
+      var streamStatusEl = document.getElementById("streamStatus");
+      var composerEl = document.getElementById("composer");
+
+      var streaming = false;
+      // The turn currently receiving deltas: {raw, acts, body, prompt}. Null
+      // when nothing is streaming. Kept as ONE live block at the end of the
+      // conversation rather than a per-question rebuild, so every earlier turn
+      // stays on screen while the newest one fills in.
+      var current = null;
+      var lastPrompt = "";
+      var chipData = [];
+      var sessionData = [];
+      var shotURL = null;
+      var menuOpen = false;
+      // Voice dialog state. `voiceListening` mirrors Swift's `voiceState` push
+      // (the page never guesses), and `voiceTranscript` is the ONLY copy of the
+      // spoken text — it never touches `#input` and never submits itself.
+      var voiceListening = false;
+      var voiceTranscript = "";
+      // The user-owned draft the CURRENT listening session APPENDS to. Each
+      // SFSpeechRecognitionTask restarts its own cumulative text at zero, so the
+      // transcript is kept OUT of Swift: this base snapshot is what the session's
+      // partials/final are joined onto. Only Send (sendVoice) or the ×
+      // (cancelVoice) end the draft's life; a stop + re-listen must NOT wipe it.
+      var voiceDraftBase = "";
+      // The CURRENT raw session text — what the recognizer last reported, within
+      // ONE SFSpeechRecognitionTask. The task's utterance boundary is INVISIBLE
+      // except as a partial that no longer extends the previous text (proven by
+      // the trace's post-pause 13->10 and 11->3 drops): when that prefix
+      // relationship breaks, the old session is committed into `voiceDraftBase`
+      // and this resets to the new partial. Distinct from the committed draft.
+      var voiceSession = "";
+      var streamTimer = null;
+      // The last panel state Swift pushed. `bar`/`mascot` are launcher-only by
+      // design — robot plus composer, no transcript — so a hidden transcript in
+      // those states is correct, not a defect.
+      var panelStateName = "mascot";
+
+      function bridge() {
+        return window.webkit && window.webkit.messageHandlers
+          && window.webkit.messageHandlers.popBridge;
+      }
+      function post(message) {
+        var b = bridge();
+        if (!b) { setStatus("no bridge", false); return false; }
+        b.postMessage(message);
+        return true;
+      }
+      function setStatus(text, ok) {
+        statusEl.textContent = text;
+        statusEl.classList.toggle("ok", !!ok);
+      }
+
+      // --- stream status line -------------------------------------------------
+      // `Thinking… 1.2s` for the whole stream, then the final state. The stall
+      // and timeout markers only ever reached STDOUT, so the panel showed an
+      // empty box and nothing else; this is the line the user actually reads.
+      // The clock starts in `setStreaming(true)` — the same turn that posts the
+      // send — and `setStreamStatus` clears the interval on every state that is
+      // not `thinking`, so no path can leave a timer ticking behind a finished
+      // answer.
+      function setStreamStatus(state, text) {
+        stopStreamTimer();
+        if (!streamStatusEl) { return; }
+        streamStatusEl.className = text ? "on " + state : "";
+        streamStatusEl.textContent = text || "";
+        // Showing or clearing the status line changes how much web region the
+        // fixed stack (status + composer) needs. Tell Swift, so the `bar` can
+        // grow to fit the composer instead of clipping it.
+        requireContentHeight(false);
+        if (state !== "thinking") { return; }
+        var startedAt = Date.now();
+        var tick = function () {
+          streamStatusEl.textContent = "working… "
+            + ((Date.now() - startedAt) / 1000).toFixed(1) + "s";
+        };
+        tick();
+        streamTimer = setInterval(tick, 100);
+      }
+      function stopStreamTimer() {
+        if (streamTimer) { clearInterval(streamTimer); streamTimer = null; }
+      }
+
+      // --- adaptive bar height ------------------------------------------------
+      // The status line lives ABOVE the composer in normal flow, so in `bar`
+      // (a 64pt web region) a shown status pushes the composer's bottom past the
+      // region's edge and the bar's own half of the composer is clipped. The
+      // fix is to let the BAR GROW to the height the page actually needs. This
+      // measures the fixed stack with the real layout (never a guessed
+      // constant) and asks Swift for it. An idle bar (status display:none)
+      // measures at or below the baseline, so Swift keeps the byte-identical
+      // 174pt window and the robot anchor does not move.
+      var lastPostedContentHeight = -1;
+      function requireContentHeight(force) {
+        if (!composerEl) { return; }
+        var bodyTop = document.body.getBoundingClientRect().top;
+        var bottom = 0;
+        [streamStatusEl, composerEl, document.getElementById("browserStrip")]
+          .forEach(function (el) {
+            if (!el) { return; }
+            var cs = getComputedStyle(el);
+            if (cs.display === "none") { return; }
+            var r = el.getBoundingClientRect();
+            bottom = Math.max(
+              bottom,
+              (r.bottom - bodyTop) + (parseFloat(cs.marginBottom) || 0)
+            );
+          });
+        var needed = Math.ceil(bottom);
+        // THE VOICE DIALOG floats ABOVE the composer, so it contributes no
+        // layout bottom and the 64pt bar would clip it. Add what it needs so the
+        // adaptive bar grows to hold it — the only channel that survives the
+        // empty-session backstop that drops a page-driven `uiHeight: full`.
+        if (voiceDlgEl && !voiceDlgEl.hidden) {
+          var docH = document.documentElement.clientHeight || 0;
+          var dr = voiceDlgEl.getBoundingClientRect();
+          needed = Math.max(needed, Math.ceil(docH - dr.top) + 8);
+        }
+        // THE `+` MENU floats ABOVE the composer as a picker surface, so it too
+        // adds no layout bottom. Its height is capped by CSS so the grown bar
+        // can always hold it; without this it rendered off the window top.
+        if (menuOpen && menuEl) {
+          var docH2 = document.documentElement.clientHeight || 0;
+          var mr = menuEl.getBoundingClientRect();
+          needed = Math.max(needed, Math.ceil(docH2 - mr.top) + 8);
+        }
+        // Dedupe so a ticking `Thinking… 0.4s` cannot spam a resize every frame;
+        // `force` is used when the panel state itself changed.
+        if (!force && needed === lastPostedContentHeight) { return; }
+        lastPostedContentHeight = needed;
+        post({ type: "uiContentHeight", state: panelStateName, height: needed });
+      }
+
+      // --- minimal markdown -------------------------------------------------
+      // Escape first: every substitution below operates on escaped text, so
+      // model output can never inject live HTML.
+      function escapeHTML(text) {
+        return text.replace(/&/g, "&amp;").replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+      }
+      function inline(text) {
+        return text
+          .replace(/`([^`]+)`/g, "<code>$1</code>")
+          .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+          .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+          .replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g,
+            '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+      }
+      function copyButton(text, label) {
+        return '<div class="codehead"><span>' + (label || "code") + "</span>"
+          + '<button type="button" data-copy="' + escapeHTML(text)
+          + '" title="copy">Copy</button></div>';
+      }
+      function renderMarkdown(source) {
+        var out = [], code = [], inCode = false, inList = false;
+        function closeList() { if (inList) { out.push("</ul>"); inList = false; } }
+        escapeHTML(source).split("\n").forEach(function (line) {
+          if (/^```/.test(line)) {
+            closeList();
+            if (inCode) {
+              var body = code.join("\n");
+              out.push('<div class="codeblock">' + copyButton(body) + "<pre><code>"
+                + body + "</code></pre></div>");
+              code = [];
+            }
+            inCode = !inCode;
+            return;
+          }
+          if (inCode) { code.push(line); return; }
+          var bullet = line.match(/^\s*[-*]\s+(.*)$/);
+          if (bullet) {
+            if (!inList) { out.push("<ul>"); inList = true; }
+            out.push("<li>" + inline(bullet[1]) + "</li>");
+            return;
+          }
+          closeList();
+          out.push(inline(line));
+        });
+        closeList();
+        if (inCode) { out.push("<code>" + code.join("\n") + "</code>"); }
+        return out.join("").replace(/(<br>)+$/, "");
+      }
+      function renderInto(el, markdown) {
+        el.innerHTML = renderMarkdown(markdown);
+        scrollToBottom();
+      }
+
+      // The bubble is the only scroll container now: it grows UPWARD from the
+      // bar and stops at 280pt, so a long answer scrolls inside itself.
+      function scrollToBottom() {
+        // FLUSH BEFORE SCROLLING. WebKit will happily apply a `scrollTop` to a
+        // stale layout box and then lose it: measured with a browser pane open,
+        // `scrollHeight` 143, `clientHeight` 88, and `scrollTop` stuck at 0 — the
+        // newest turn sat 42px BELOW the visible box while every DOM probe was
+        // green. Reading a computed style first forces the layout the scroll is
+        // about to be applied to.
+        void getComputedStyle(bubbleEl).display;
+        bubbleEl.scrollTop = bubbleEl.scrollHeight;
+      }
+
+      // NO SCROLL CUE, BY USER DECISION. There used to be a floating
+      // "scroll for more" bar over the transcript's lower edge. It is gone: the
+      // transcript scrolls natively and nothing overlays it. (Its label also
+      // rendered a LITERAL `\u2193` — the HTML file is not a Swift string, so
+      // the escape was never decoded, and the user saw the backslash.)
+
+      // --- turns ---------------------------------------------------------------
+      function actionsFor(raw, promptText) {
+        return '<div class="actions">'
+          + '<button type="button" data-copy="' + escapeHTML(raw) + '">Copy</button>'
+          + (promptText
+            ? '<button type="button" data-retry="' + escapeHTML(promptText) + '">Retry</button>'
+            : "")
+          + "</div>";
+      }
+
+      // A user turn: a compact right-aligned pill. Text only, never HTML —
+      // the user typed it, and the panel must not be a rendering surface for
+      // its own input.
+      function appendUserTurn(text) {
+        var turn = document.createElement("div");
+        turn.className = "turn user";
+        var pill = document.createElement("span");
+        pill.className = "bubble-pill";
+        pill.textContent = text;
+        turn.appendChild(pill);
+        bubbleEl.appendChild(turn);
+        scrollToBottom();
+        return turn;
+      }
+
+      // An assistant turn: full-width prose plus its own copy/retry actions.
+      // `promptText` is remembered per turn so Retry re-sends THAT question,
+      // not whichever one happened to be sent last.
+      function appendAssistantTurn(promptText) {
+        var turn = document.createElement("div");
+        turn.className = "turn assistant";
+        var body = document.createElement("span");
+        body.className = "answer";
+        turn.appendChild(body);
+        // The actions row is the ELEMENT itself, not `actionsFor(...).firstChild`:
+        // `appendChild` MOVES a node, so reading `firstChild` after the move
+        // returns null and every later `refreshActions()` threw — which left
+        // Copy/Retry dead on exactly the block the user was looking at.
+        var acts = document.createElement("div");
+        acts.className = "actions";
+        acts.innerHTML = actionsFor("", promptText || "");
+        turn.appendChild(acts);
+        bubbleEl.appendChild(turn);
+        scrollToBottom();
+        return { turn: turn, raw: "", acts: acts, body: body };
+      }
+
+      // Starts the streaming block. A live turn is never appended when one is
+      // already open: `chatDelta` without a preceding `chatUser` would then
+      // stack one orphan block per delta.
+      function beginStreaming(promptText) {
+        if (current && current.body) { return current; }
+        current = appendAssistantTurn(promptText);
+        lastPrompt = promptText || "";
+        return current;
+      }
+
+      function refreshActions() {
+        if (!current || !current.acts) { return; }
+        current.acts.innerHTML = actionsFor(current.raw, lastPrompt);
+      }
+      // "Does the transcript hold a conversation?" \u2014 answered by asking the
+      // RENDERED TRANSCRIPT, which is `#bubble` holding `.turn` blocks. The old
+      // check asked the live streaming handle instead, and `chatDone` has
+      // already cleared that handle (`current = null`) before asking: the
+      // answer was therefore ALWAYS false, and every completed reply collapsed
+      // the panel from `full` back to `bar`, hiding the answer it had just
+      // rendered. Any turn counts \u2014 user or assistant.
+      function hasBubbleContent() {
+        return !!bubbleEl.querySelector(".turn");
+      }
+      // The FINALIZED answer, which is what the existing probes read: the last
+      // assistant turn on screen, streaming block included.
+      function lastAssistantAnswer() {
+        var turns = bubbleEl.querySelectorAll(".turn.assistant .answer");
+        return turns.length ? turns[turns.length - 1] : null;
+      }
+
+      function setCaret(on) {
+        var target = (current && current.body) || lastAssistantAnswer();
+        if (!target) { return; }
+        var existing = target.querySelector("#caret");
+        if (existing) { existing.remove(); }
+        if (!on) { return; }
+        var caret = document.createElement("span");
+        caret.id = "caret";
+        caret.textContent = "▍";
+        target.appendChild(caret);
+      }
+
+      // --- composer state ---------------------------------------------------
+      function setStreaming(on) {
+        streaming = on;
+        // An open approval card keeps the composer disabled: a mutating tool
+        // waiting on a click must stay the only thing the user can act on.
+        inputEl.disabled = openApprovals.length > 0;
+        sendEl.hidden = on;
+        stopEl.hidden = !on;
+        if (on) { setStreamStatus("thinking", "working… 0.0s"); }
+        if (!on) { updateSendButton(); inputEl.focus(); }
+      }
+      function updateSendButton() {
+        var has = inputEl.value.trim().length > 0;
+        sendEl.classList.toggle("active", has && !streaming);
+        sendEl.classList.toggle("stop", streaming);
+        sendEl.title = streaming ? "Stop" : (has ? "Send" : "Nothing to send");
+      }
+
+      function send(text, source) {
+        if (streaming || !text || !text.trim()) { return; }
+        closeMenu();
+        // THE RETURN-KEY REFLEX. The user's own turn, the emptied composer
+        // and the "working…" status are all set in ONE synchronous tick,
+        // BEFORE the send is handed to Swift. Handing `chatSend` over first
+        // meant the native side could begin provider/model work while the
+        // page had not yet mutated the DOM, so the message sat in the composer
+        // and the transcript stayed empty until the echo came back — the
+        // "did my message even go?" symptom. Local UI first; the bridge call
+        // LAST.
+        // The turn goes in FIRST, then the content layer opens: the page has
+        // content to show the moment it stops claiming to be empty, which is the
+        // only thing `chat-empty` decides.
+        appendUserTurn(text);
+        revealChat();
+        lastPrompt = text;
+        beginStreaming(text);
+        inputEl.value = "";
+        updateSendButton();
+        setStreaming(true);
+        // `source` rides the same bridge message the typed path uses; an absent
+        // source is omitted, so a typed turn stays exactly as it was. A voice
+        // turn carries `"voice"` all the way to `finish`, which is what makes
+        // Pop SPEAK the reply.
+        var message = { type: "chatSend", text: text };
+        if (source) { message.source = source; }
+        post(message);
+      }
+
+      // --- `+` menu ---------------------------------------------------------
+      // The popover lives inside the bar's own stacking context, so it paints
+      // above the transcript without any extra z-index bookkeeping.
+      function openMenu() {
+        if (menuOpen) { return; }
+        menuOpen = true;
+        menuEl.classList.add("open");
+        plusEl.setAttribute("aria-expanded", "true");
+        // The popover needs room the bar alone does not have; ask for it.
+        post({ type: "uiHeight", state: "full" });
+        // `uiHeight: full` is DROPPED while the session is empty, so the
+        // content-height channel is what actually grows the bar to hold the
+        // popover — the same mechanism the voice dialog relies on.
+        requireContentHeight(true);
+      }
+      function closeMenu() {
+        if (!menuOpen) { return; }
+        menuOpen = false;
+        menuEl.classList.remove("open");
+        plusEl.setAttribute("aria-expanded", "false");
+        post({ type: "uiHeight", state: "bar" });
+        requireContentHeight(true);
+      }
+      // A TRUE toggle for the History pill: one press opens, the next closes —
+      // so a popover that once rendered off-screen cannot latch `menuOpen` true
+      // and swallow every later press. The `+` button keeps its own paths.
+      function toggleMenu() {
+        menuOpen ? closeMenu() : openMenu();
+      }
+
+      // --- voice dialog -----------------------------------------------------
+      // The dialog OWNS the voice turn lifecycle: listen → review → send on the
+      // user's terms. It is opened by `voiceState(true)` and the Send button is
+      // only ever a user click — no recognition event submits a turn.
+      // Opening/closing the dialog grows/shrinks the panel exactly as the `+`
+      // menu does, AND re-measures the fixed stack: the dialog floats ABOVE the
+      // composer, so it needs the adaptive bar to grow (a page `uiHeight: full`
+      // is ignored while the session is still empty, so the content-height
+      // channel is what actually makes room on the first voice turn).
+      function showVoiceDlg() {
+        if (!voiceDlgEl.hidden) { return; }
+        voiceDlgEl.hidden = false;
+        // In voice-only the panel is sized to the dialog by the CONTENT-HEIGHT
+        // channel; asking for `full` would re-inflate it into a big empty void.
+        // Only the normal (composer) surface grows on open.
+        if (!document.body.classList.contains("voiceOnly")) {
+          post({ type: "uiHeight", state: "full" });
+        }
+        requireContentHeight(true);
+      }
+      function hideVoiceDlg() {
+        if (voiceDlgEl.hidden) { return; }
+        voiceDlgEl.hidden = true;
+        // Mirror `closeMenu()`'s restore. A send immediately follows with its
+        // own send-exempt full request, so a voice turn still expands.
+        post({ type: "uiHeight", state: "bar" });
+        requireContentHeight(true);
+      }
+      function resetVoice() {
+        voiceTranscript = "";
+        // Ending the draft (Send or ×) must also drop its base, or the discarded
+        // text would leak into the NEXT listen's three-way join.
+        voiceDraftBase = "";
+        // And drop the raw session: a fresh task must not treat the prior
+        // session's last partial as its own continuation.
+        voiceSession = "";
+        voiceTextEl.textContent = "";
+      }
+      // The DRAFT invariant, in one place: a listening session's text is joined
+      // onto whatever the user already dictated. Both non-empty -> a single
+      // space between them; one empty -> the other; both empty -> "". The base
+      // is empty only before the first listen and after Send/×, so every live
+      // session correctly appends instead of replacing.
+      function joinDraft(base, sessionText) {
+        if (base && sessionText) { return base + " " + sessionText; }
+        return base || sessionText || "";
+      }
+      // SESSION TRACKER: the recognizer's utterance boundary is invisible except
+      // as a partial that STOPS EXTENDING the running session text. A continuation
+      // or a within-utterance revision grows/fixes the text while sharing a prefix
+      // (trace: 28->26->28 keeps the prefix); a RESET is a partial with no prefix
+      // relationship either way (trace: 13->10, 11->3 after a pause). On reset the
+      // prior session will never be revised again, so COMMIT it to the draft and
+      // start a fresh session. Empty raw is ignored (must not clear anything).
+      function extendSession(raw) {
+        if (!raw) { return; }
+        if (!voiceSession) { voiceSession = raw; return; }
+        var s = voiceSession.toLowerCase(), t = raw.toLowerCase();
+        if (t.indexOf(s) === 0 || s.indexOf(t) === 0) {
+          voiceSession = raw; return;
+        }
+        voiceDraftBase = joinDraft(voiceDraftBase, voiceSession);
+        voiceSession = raw;
+      }
+      function updateVoiceDlg() {
+        // The dialog's mic mirrors the composer's: ON while listening, OFF once
+        // recognition stops, in both directions driven only by Swift's push.
+        voiceMicEl.classList.toggle("active", voiceListening);
+        voiceMicEl.title = voiceListening ? "Stop listening" : "Talk to Pop";
+        var has = voiceTranscript.trim().length > 0;
+        voiceLabelEl.textContent = voiceListening
+          ? "Listening\u2026"
+          : (has ? "Ready to send" : "Stopped");
+        // Send appears ONLY when listening is OFF and there is something to send.
+        var canSend = !voiceListening && has && !streaming;
+        voiceSendEl.hidden = !canSend;
+        voiceSendEl.disabled = !canSend;
+      }
+      function sendVoice() {
+        if (voiceListening || !voiceTranscript.trim()) { return; }
+        var text = voiceTranscript;
+        hideVoiceDlg();
+        resetVoice();
+        updateVoiceDlg();
+        send(text, "voice");
+        // Tell Swift the voice turn is away: it drops voice-only and collapses to
+        // the mascot. A VOICE TURN NEVER SURFACES THE COMPOSER — the turn runs on
+        // with the panel collapsed, and the user reads the exchange by clicking
+        // the robot.
+        post({ type: "voiceSent" });
+      }
+      function cancelVoice() {
+        // The × cancels WITHOUT a turn: stop listening if it is live, hide, drop
+        // the transcript. Nothing reaches the pipeline.
+        if (voiceListening) { post({ type: "voiceToggle" }); }
+        hideVoiceDlg();
+        resetVoice();
+        updateVoiceDlg();
+        // Tell Swift the voice surface is closed: drop voice-only and collapse
+        // to the mascot.
+        post({ type: "voiceClosed" });
+      }
+
+      // --- conversations -------------------------------------------------------
+      function renderSessions() {
+        sessionsEl.innerHTML = "";
+        var head = document.createElement("div");
+        head.className = "menu-head";
+        head.textContent = "Conversations";
+        sessionsEl.appendChild(head);
+        if (!sessionData.length) {
+          var none = document.createElement("div");
+          none.className = "empty";
+          none.textContent = "No past conversations yet";
+          sessionsEl.appendChild(none);
+          return;
+        }
+        sessionData.forEach(function (session) {
+          var row = document.createElement("button");
+          row.type = "button";
+          row.className = "session-row" + (session.current ? " current" : "");
+          row.title = session.title + " · " + (session.turns || "0") + " turns";
+          row.innerHTML = '<span class="session-title"></span>'
+            + '<span class="session-time"></span>';
+          row.querySelector(".session-title").textContent = session.title || "Untitled";
+          row.querySelector(".session-time").textContent = session.time || "";
+          row.addEventListener("click", function () {
+            closeMenu();
+            post({ type: "openSession", id: session.id });
+          });
+          sessionsEl.appendChild(row);
+        });
+      }
+
+      // --- context toggles --------------------------------------------------
+      function renderChips() {
+        chipsEl.innerHTML = "";
+        chipData.forEach(function (chip) {
+          var on = chip.on !== false;
+          var el = document.createElement("button");
+          el.className = "chip" + (on ? "" : " off");
+          el.type = "button";
+          el.title = on ? "Included in the next request" : "Excluded from the next request";
+          var inner = "";
+          if (chip.kind === "shot" && shotURL) {
+            inner += '<img class="shot" alt="" src="' + shotURL + '" />';
+          }
+          inner += "<span>" + escapeHTML(chip.label) + "</span>"
+            + '<span class="state">' + (on ? "✓" : "○") + "</span>";
+          el.innerHTML = inner;
+          chipsEl.appendChild(el);
+        });
+      }
+
+      // --- approval cards ---------------------------------------------------
+      // Open cards, newest last. The composer is disabled while ANY is open,
+      // because a mutating tool waiting on a click must be the only thing the
+      // user can act on.
+      var openApprovals = [];
+
+      function setApprovalPending(on) {
+        openApprovals.forEach(function (entry) { entry.el.classList.toggle("resolved", !on); });
+        inputEl.disabled = on;
+        sendEl.disabled = on;
+        approvalNoteEl.hidden = !on;
+        if (!on) { updateSendButton(); }
+      }
+
+      function openApproval(el, card) {
+        openApprovals.push({ el: el, card: card });
+        setApprovalPending(true);
+      }
+
+      function closeApproval(el) {
+        var index = openApprovals.findIndex(function (entry) { return entry.el === el; });
+        if (index >= 0) { openApprovals.splice(index, 1); }
+        el.classList.add("resolved");
+        if (openApprovals.length === 0) { setApprovalPending(false); }
+      }
+
+      function renderApprovalCard(card) {
+        var el = document.createElement("div");
+        el.className = "approval-card";
+        el.dataset.approval = "1";
+
+        var head = document.createElement("div");
+        head.className = "ac-head";
+        var tool = document.createElement("span");
+        tool.className = "ac-tool";
+        tool.textContent = card.tool || "tool";
+        var risk = document.createElement("span");
+        risk.className = "ac-risk";
+        risk.textContent = card.risk || "changes files";
+        head.appendChild(tool);
+        head.appendChild(risk);
+        el.appendChild(head);
+
+        if (card.text) {
+          // Typed text: the exact string plus where it goes — a sentence, never
+          // raw JSON.
+          var sentence = document.createElement("div");
+          sentence.className = "ac-summary";
+          sentence.textContent = card.summary || "Type this exact text:";
+          el.appendChild(sentence);
+          var textBlock = document.createElement("div");
+          textBlock.className = "ac-text";
+          textBlock.textContent = card.text;
+          el.appendChild(textBlock);
+          if (card.target) {
+            var target = document.createElement("div");
+            target.className = "ac-target";
+            target.textContent = "Target: " + card.target;
+            el.appendChild(target);
+          }
+        } else {
+          var preview = document.createElement("div");
+          preview.className = "ac-preview";
+          preview.textContent = card.preview || "";
+          el.appendChild(preview);
+        }
+
+        // jev ADVISORY LINE. Rendered ONLY when Swift attached a `jev` object
+        // (feature enabled). ABSENT means jev is off, and the card is unchanged
+        // — no placeholder, no layout shift. The line never gates the decisions
+        // below it: it is a suggestion with a strength, nothing more.
+        if (card.jev) {
+          var jev = document.createElement("div");
+          jev.className = "ac-jev";
+          if (card.jev.available) {
+            var pct = Math.round(((card.jev.strength || 0) * 100));
+            jev.textContent = "jev: " + (card.jev.choice || "?") + " \u00b7 "
+              + pct + "% \u00b7 advisory only";
+          } else {
+            jev.textContent = "jev: unavailable \u2014 rule-based default";
+          }
+          el.appendChild(jev);
+        }
+
+        var actions = document.createElement("div");
+        actions.className = "ac-actions";
+
+        var runBtn = document.createElement("button");
+        runBtn.type = "button";
+        runBtn.className = "ac-run";
+        runBtn.textContent = "Run";
+        runBtn.addEventListener("click", function () {
+          resolveApproval(el, { decision: "run" });
+        });
+
+        var editBtn = document.createElement("button");
+        editBtn.type = "button";
+        editBtn.textContent = "Edit";
+        editBtn.addEventListener("click", function () {
+          showApprovalEditor(el, card);
+        });
+
+        var denyBtn = document.createElement("button");
+        denyBtn.type = "button";
+        denyBtn.className = "ac-deny";
+        denyBtn.textContent = "Deny";
+        denyBtn.addEventListener("click", function () {
+          resolveApproval(el, { decision: "deny" });
+        });
+
+        actions.appendChild(runBtn);
+        actions.appendChild(editBtn);
+        actions.appendChild(denyBtn);
+        el.appendChild(actions);
+
+        var note = document.createElement("div");
+        note.className = "ac-note";
+        note.textContent = "waiting for approval\u2026";
+        el.appendChild(note);
+        return el;
+      }
+
+      function showApprovalEditor(el, card) {
+        if (el.querySelector(".ac-edit")) { return; }
+        var wrap = document.createElement("div");
+        wrap.className = "ac-edit";
+        var area = document.createElement("textarea");
+        // Pre-filled with the EXACT JSON that would run, pretty-printed: the
+        // user is correcting arguments, not writing them from scratch.
+        area.value = JSON.stringify(card.arguments || {}, null, 2);
+        area.setAttribute("aria-label", "Tool arguments as JSON");
+        wrap.appendChild(area);
+
+        var row = document.createElement("div");
+        row.className = "ac-actions";
+        var save = document.createElement("button");
+        save.type = "button";
+        save.className = "ac-run";
+        save.textContent = "Run edited";
+        save.addEventListener("click", function () {
+          var parsed;
+          try {
+            parsed = JSON.parse(area.value);
+          } catch (e) {
+            var error = document.createElement("div");
+            error.className = "ac-note";
+            error.textContent = "That is not valid JSON \u2014 fix it or press Deny.";
+            wrap.appendChild(error);
+            return;
+          }
+          resolveApproval(el, { decision: "edit", arguments: parsed });
+        });
+        var cancel = document.createElement("button");
+        cancel.type = "button";
+        cancel.textContent = "Cancel";
+        cancel.addEventListener("click", function () {
+          wrap.remove();
+          var runBtn = el.querySelector("button.ac-run");
+          if (runBtn) { runBtn.focus(); }
+        });
+        row.appendChild(save);
+        row.appendChild(cancel);
+        wrap.appendChild(row);
+
+        el.insertBefore(wrap, el.querySelector(".ac-actions"));
+        area.focus();
+      }
+
+      function resolveApproval(el, payload) {
+        var entry = openApprovals.find(function (item) { return item.el === el; });
+        var card = entry ? entry.card : {};
+        var message = {
+          type: "approvalVerdict",
+          id: card.id || "",
+          decision: payload.decision
+        };
+        if (payload.arguments !== undefined) { message.arguments = payload.arguments; }
+        post(message);
+        closeApproval(el);
+        // The keyboard must not stay trapped in a card that no longer exists.
+        if (document.activeElement && el.contains(document.activeElement)) {
+          inputEl.focus();
+        }
+      }
+
+      // --- Swift -> UI ------------------------------------------------------
+      // Defined before `load` so a fast native call cannot land first.
+      window.popAPI = {
+        focusInput: function () {
+          // The composer region is hidden while the panel is in `mascot`, and
+          // `focus()` on a hidden input is a silent no-op — so the cursor would
+          // never land. Clear the hiding flags up the ancestor chain, focus,
+          // and if the caret still did not take, retry once after a frame.
+          var node = inputEl;
+          while (node && node !== document.body) {
+            if (node.style) {
+              if (node.style.display === "none") { node.style.display = ""; }
+              if (node.style.visibility === "hidden") { node.style.visibility = ""; }
+            }
+            node.removeAttribute?.("hidden");
+            node = node.parentElement;
+          }
+          inputEl.focus();
+          if (document.activeElement !== inputEl) {
+            setTimeout(function () {
+              inputEl.focus();
+              if (document.activeElement !== inputEl) {
+                inputEl.select?.();
+                inputEl.click?.();
+              }
+            }, 150);
+          }
+        },
+        // Swift can open the `+` menu (the hover toolbar's History action);
+        // exposed so the native side calls through the same guarded function
+        // the page uses, not a bare global. `toggleMenu` is the History pill's
+        // true toggle; `closeMenu` lets the audit probe put the surface back.
+        openMenu: openMenu,
+        closeMenu: closeMenu,
+        toggleMenu: toggleMenu,
+        chatUser: function (text) {
+          // The question is a turn of its own now. Guarded against a double
+          // append: `send()` already renders it optimistically before the
+          // native side echoes it back.
+          if (!streaming) {
+            revealChat();
+            appendUserTurn(text);
+            lastPrompt = text || "";
+          }
+          beginStreaming(text);
+        },
+        chatDelta: function (text) {
+          revealChat();
+          var live = beginStreaming(lastPrompt);
+          live.raw += text;
+          renderInto(live.body, live.raw);
+          refreshActions();
+          setCaret(true);
+        },
+        chatDone: function (full) {
+          // Streaming state is cleared FIRST. Every later line in this handler
+          // can throw, and a throw left `streaming` true forever — the send
+          // button stayed in stop mode and the composer dropped every
+          // subsequent send before it ever reached Swift.
+          setStreaming(false);
+          if (!current || !current.body) {
+            setStreamStatus("error", "error");
+            setStatus("error", false);
+            return;
+          }
+          // The streaming block IS the final turn: it is already the last
+          // assistant block in the container, so `chatDone` only has to settle
+          // its text — there is nothing to merge or move.
+          renderInto(current.body, full || current.raw);
+          current.raw = full || current.raw;
+          refreshActions();
+          setCaret(false);
+          current = null;
+          setStreamStatus("ready", "ready");
+          setStatus("ready", true);
+          // NEWEST-TURN VISIBILITY: a finished answer is only delivered if the
+          // user can see it. `renderInto` already scrolled, but the actions row
+          // and the caret removal above change the content height AFTER that
+          // scroll — so the scroll is repeated here, last, and is the last thing
+          // this handler does.
+          scrollToBottom();
+          if (!hasBubbleContent()) { post({ type: "uiHeight", state: "bar" }); }
+          // Last of all, because it must observe the settled DOM: the answer is
+          // rendered, the panel is where Swift put it, and only now can the page
+          // say whether the user can actually SEE it.
+          post({ type: "transcriptVisibility", state: ensureTranscriptVisible() });
+        },
+        chatError: function (message) {
+          // Same rule as chatDone: unstick the composer before doing anything
+          // that can throw. A failed request must never leave the page unable
+          // to accept the next one.
+          setStreaming(false);
+          setStreamStatus("error", "error");
+          setStatus("error", false);
+          var live = beginStreaming(lastPrompt);
+          if (!live || !live.body) { return; }
+          bubbleEl.classList.add("error");
+          renderInto(live.body, "⚠️ " + message);
+          setCaret(false);
+          current = null;
+        },
+        // The on-device brain streamed a NON-ANSWER (or an echo of the user's
+        // own words) and Swift is switching to the cloud brain. Discard what is
+        // already in the live block so the user's question is never left
+        // standing as the answer; the fallback replies into the same turn.
+        chatReset: function () {
+          if (!current || !current.body) { return; }
+          current.raw = "";
+          renderInto(current.body, "");
+          refreshActions();
+          setCaret(true);
+        },
+        // The user pressed STOP. This is not a silent teardown: the turn keeps
+        // whatever arrived, gains a `stopped by you` receipt, and the status
+        // line says `stopped`. An empty assistant block after a stop is the
+        // exact symptom this replaces \u2014 it read as "Pop dropped my question".
+        // The body is ALWAYS written to, so a stop before the first token still
+        // leaves the receipt rather than a hollow turn.
+        chatStopped: function () {
+          setStreaming(false);
+          setStreamStatus("stopped", "stopped");
+          setStatus("stopped", false);
+          var live = current || beginStreaming(lastPrompt);
+          if (!live || !live.body) { return; }
+          bubbleEl.classList.remove("error");
+          var partial = (live.raw || "").trim();
+          renderInto(live.body, partial);
+          var note = document.createElement("span");
+          note.className = "stopped-note";
+          note.textContent = "stopped by you";
+          live.body.appendChild(note);
+          live.raw = (partial ? partial + "\n\n" : "") + "stopped by you";
+          refreshActions();
+          setCaret(false);
+          current = null;
+        },
+        newChat: function () {
+          // Display reset only: every finished session stays on disk and in
+          // the `+` menu.
+          bubbleEl.innerHTML = "";
+          bubbleEl.classList.remove("error");
+          current = null;
+          lastPrompt = "";
+          setStreaming(false);
+          setStreamStatus("idle", "");
+          setStatus("new chat", true);
+          inputEl.focus();
+          post({ type: "uiHeight", state: "bar" });
+        },
+        prefill: function (text) {
+          // A selection prefill must never auto-send.
+          inputEl.value = text || "";
+          updateSendButton();
+          inputEl.focus();
+          setStatus("prefilled", true);
+        },
+        // VOICE-ONLY surface toggle. `true` hides the composer + transcript and
+        // parks the dialog at the bottom (a listen that began at the mascot);
+        // `false` restores the normal bar. Re-measures so the adaptive bar sizes
+        // to whatever the current surface needs.
+        voiceOnly: function (flag) {
+          // A listening session APPENDS to the user's draft: snapshot the current
+          // transcript as the base to join onto. The draft is only cleared by
+          // Send or ×, so neither a prior session nor a prior test's text is
+          // wiped here — re-entering voice must PRESERVE it. `voiceState(true)`
+          // snapshots too; doing it here makes the ordering irrelevant. The
+          // session tracker resets too: the NEW task's first partial is its own
+          // session, not a continuation of the previous task's last partial.
+          if (flag) { voiceDraftBase = voiceTranscript; voiceSession = ""; }
+          document.body.classList.toggle("voiceOnly", !!flag);
+          requireContentHeight(true);
+        },
+        // Voice input drives the DIALOG, never `#input`. `voiceState` lights the
+        // composer mic AND opens/closes the dialog; partials and the final both
+        // fill the dialog transcript. The final does NOT send — the user does.
+        voiceState: function (active) {
+          micEl.classList.toggle("active", !!active);
+          voiceListening = !!active;
+          if (active) {
+            // Listening again APPENDS to the existing draft: snapshot the transcript
+            // as the base for this session's cumulative partials. The boundary that
+            // matters is the recognizer's OWN utterance segmentation (proven by the
+            // trace's post-pause 13->10 drop), NOT the mic toggle: even mic-untouched,
+            // a new utterance is detected by the prefix break in `extendSession`.
+            // The dialog text is user-owned and persists until Send or ×; the raw
+            // session tracker restarts so this task's first partial is fresh.
+            voiceDraftBase = voiceTranscript;
+            voiceSession = "";
+            showVoiceDlg();
+          } else if (voiceTranscript.trim()) {
+            // Listening stopped with words on screen: park in send-ready in
+            // voice-only (Send visible). The dialog never submits itself.
+            showVoiceDlg();
+          } else {
+            hideVoiceDlg();
+            // In voice-only an EMPTY stop would leave nothing on screen (the
+            // composer is hidden): exit the surface so the panel can collapse.
+            if (document.body.classList.contains("voiceOnly")) {
+              post({ type: "voiceClosed" });
+            }
+          }
+          updateVoiceDlg();
+        },
+        voicePartial: function (text) {
+          // Partials are cumulative WITHIN one utterance, but the recognizer can
+          // silently start a NEW utterance mid-listen (11->3 in the trace). Feed
+          // the raw partial through the tracker: a prefix continuation/revision
+          // updates the session; a prefix break commits the old session first, so
+          // the dialog never replaces the earlier sentence. Then join the session
+          // onto the draft so earlier dictation survives.
+          extendSession(text || "");
+          voiceTranscript = joinDraft(voiceDraftBase, voiceSession);
+          voiceTextEl.textContent = voiceTranscript;
+          voiceTextEl.scrollTop = voiceTextEl.scrollHeight;
+          updateVoiceDlg();
+          // The transcript GROWS the dialog, so re-measure: without this the bar
+          // stays sized for the empty dialog and the taller text clips upward.
+          requireContentHeight(true);
+        },
+        voiceFinal: function (text) {
+          // The final ends the session: run it through the tracker first (it may
+          // itself be the reset boundary), then COMMIT the raw session to the
+          // draft and clear it so nothing is double-counted. This must also catch
+          // a final arriving AFTER an in-session reset — the partial already
+          // committed the prior session, so only the final's own text is joined.
+          extendSession(text || "");
+          voiceDraftBase = joinDraft(voiceDraftBase, voiceSession);
+          voiceSession = "";
+          voiceTranscript = voiceDraftBase;
+          voiceTextEl.textContent = voiceTranscript;
+          // Show the dialog if a final lands after listening already closed (the
+          // 55s cap / a fast stop can beat the last partial); still NO send.
+          if (voiceTranscript.trim()) { showVoiceDlg(); }
+          updateVoiceDlg();
+          requireContentHeight(true);
+        },
+        history: function (entries) {
+          // A RESTORED conversation: every turn is rendered, oldest first, as
+          // the pair of blocks it really was. History used to be discarded
+          // here — the single bubble had nowhere to put it.
+          bubbleEl.innerHTML = "";
+          bubbleEl.classList.remove("error");
+          current = null;
+          lastPrompt = "";
+          setStreamStatus("idle", "");
+          (entries || []).forEach(function (entry) {
+            if (entry.role === "user") {
+              appendUserTurn(entry.text);
+              lastPrompt = entry.text;
+            } else {
+              var turn = appendAssistantTurn(lastPrompt);
+              turn.raw = entry.text;
+              renderInto(turn.body, entry.text);
+              turn.acts.innerHTML = actionsFor(entry.text, lastPrompt);
+            }
+          });
+          revealChat();
+          scrollToBottom();
+        },
+        approvalCard: function (card) {
+          // A mutating tool is parked on a click. The card goes inline in the
+          // transcript, the composer is disabled so nothing else is sent while
+          // a decision is outstanding, and focus moves to the FIRST BUTTON —
+          // never to the textarea, and never to the composer, whose caret the
+          // user was in the middle of typing.
+          var cardEl = renderApprovalCard(card || {});
+          revealChat();
+          bubbleEl.appendChild(cardEl);
+          openApproval(cardEl, card || {});
+          scrollToBottom();
+          var first = cardEl.querySelector("button.ac-run");
+          if (first) { try { first.focus(); } catch (e) { /* focus is best effort */ } }
+        },
+        browserState: function (state) {
+          // Swift is the authority on whether the browser pane is up. The page
+          // only reserves the band and collapses the transcript; it never opens
+          // a window of its own.
+          var st = state || {};
+          var on = !!st.active;
+          document.body.classList.toggle("browser-open", on);
+          var strip = document.getElementById("browserStrip");
+          if (on) {
+            strip.innerHTML = "";
+            var url = document.createElement("span");
+            url.className = "bs-url";
+            url.textContent = st.url || "";
+            var status = document.createElement("span");
+            status.className = "bs-status";
+            // `status` is where a failure becomes legible: "loading…" while it
+            // works, "page blocked: file:// not allowed" when it cannot.
+            status.textContent = st.status ? "  " + st.status : "";
+            strip.appendChild(url);
+            strip.appendChild(status);
+          } else {
+            strip.textContent = "offline — no page";
+          }
+          // Opening or closing the pane changes how much room the transcript
+          // has, so its scroll position and its cue are re-evaluated here: a
+          // scrollTop chosen for the old height is meaningless in the new one.
+          scrollToBottom();
+        },
+        toolActivity: function (text) {
+          // Rendered as its own compact line, appended in call order. The
+          // streaming block stays last: a tool that runs mid-answer must not
+          // push the answer below the fold.
+          revealChat();
+          var line = document.createElement("div");
+          line.className = "tool-line" + (/error/i.test(text || "") ? " error" : "");
+          line.textContent = text || "";
+          bubbleEl.appendChild(line);
+          scrollToBottom();
+        },
+        planUpdate: function (blocks) {
+          // ONE PLAN BLOCK, REPLACED IN PLACE. The plan is the work in
+          // progress, not a stream of events: a status change must rewrite the
+          // steps the user is already reading, never append another copy under
+          // them (that is the scroll spam this API exists to prevent). Keyed by
+          // `id`, so there is exactly one `.plan-block[data-plan-id]` per plan.
+          revealChat();
+          (blocks || []).forEach(function (entry) {
+            var id = (entry && entry.id) || "current";
+            var block = document.querySelector('.plan-block[data-plan-id="' + id + '"]');
+            if (!entry || !entry.lines) {
+              // An empty update is the turn's plan being cleared.
+              if (block) { block.remove(); }
+              return;
+            }
+            if (!block) {
+              block = document.createElement("div");
+              block.className = "plan-block";
+              block.setAttribute("data-plan-id", id);
+              bubbleEl.appendChild(block);
+            }
+            block.textContent = "";
+            String(entry.lines).split("\n").forEach(function (text) {
+              if (!text) { return; }
+              var step = document.createElement("div");
+              step.className = "plan-step";
+              var blocked = /\[\!\]\s/.test(text);
+              var running = /\[\~\]\s/.test(text);
+              var done = /\[x\]\s/.test(text);
+              step.className += blocked ? " blocked" : (running ? " running" : (done ? " done" : ""));
+              step.textContent = text;
+              block.appendChild(step);
+            });
+          });
+          scrollToBottom();
+        },
+        sessions: function (list) {
+          // The `+` menu's Conversations section. Purely a list: selecting one
+          // posts `openSession` back, and the NATIVE side owns the restore.
+          sessionData = list || [];
+          renderSessions();
+        },
+        contextChips: function (chips) {
+          chipData = chips || [];
+          renderChips();
+        },
+        // Bar state is LAUNCHER ONLY: robot plus composer, no chat. The archive
+        // history lands in `#log` at uiReady, so `#log` is never `:empty` and a
+        // CSS empty check alone cannot suppress the transcript backdrop — Swift's
+        // state is the authority. Default is `launcher` in the body class, so
+        // nothing is visible before the first state arrives.
+        panelState: function (name) {
+          // Swift is the authority on the PANEL; the page only remembers what it
+          // was told, so `ensureTranscriptVisible` can tell "hidden because the
+          // panel is launcher-only" (correct) from "hidden while the panel says
+          // full" (a blank panel, never acceptable).
+          panelStateName = name || "mascot";
+          document.body.classList.toggle("launcher", name !== "full");
+          // The state changed, so re-ask even if the measured value is
+          // unchanged since the last post: the previous value may have been
+          // ignored by Swift while it was in another state.
+          requireContentHeight(true);
+        },
+        contextShot: function (dataURL) {
+          shotURL = dataURL || null;
+          renderChips();
+        },
+        providerStatus: function (status) {
+          if (!status) { return; }
+          privacyEl.classList.toggle("cloud", !!status.cloud);
+          privacyLabel.textContent = status.label || "";
+          privacyEl.title = status.cloud
+            ? "This conversation is sent to a remote provider."
+            : "This conversation runs on this Mac.";
+        },
+        // PRODUCTION TURN STATUS. Swift is the authority on WHEN a turn is
+        // working (emitted before the first model call) and the label the user
+        // reads; the page's own `setStreaming` sets the same state at send, so
+        // this only confirms it from the loop and keeps the clock ticking.
+        turnStatus: function (state, text) {
+          if (state === "ready") { setStreamStatus("ready", text || "ready"); return; }
+          setStreamStatus("thinking", text || "working… 0.0s");
+        },
+        // TEST HOOK: drives the SAME `setStreamStatus` the app uses, so a probe
+        // can measure the composer with the status line shown without needing a
+        // live model. Production never calls this; it hand-pokes nothing.
+        __setStreamStatusForProbe: function (state, text) {
+          setStreamStatus(state || "ready", text || "");
+        },
+        // TEST HOOK: clears the voice draft (transcript + base + session) the
+        // SAME way Send/× do, so a probe can drive the within-session utterance
+        // boundary from a known-empty base WITHOUT a live mic. Production never
+        // calls this.
+        __resetVoiceForProbe: function () {
+          resetVoice();
+        }
+      };
+
+      // Legacy shim: the M0 ping/pong handshake must keep working.
+      window.__popPong = function () { setStatus("bridge ok", true); };
+
+      // --- events -----------------------------------------------------------
+      // The messages area stays hidden until this session has actually produced
+      // a message. `body.launcher` is the panel-state layer; this is the content
+      // layer, so a page-driven state flip alone can never reveal an empty
+      // transcript. BY DEFAULT, DO NOT SHOW CHAT.
+      function revealChat() {
+        // Revealing the transcript and showing its NEWEST turn are one action:
+        // WebKit drops a `scrollTop` assigned while the element is `display: none`
+        // and hands the element back with `scrollTop === 0`, so a scroll that
+        // happened before the reveal leaves the user looking at the OLDEST turn.
+        var wasSuppressed = document.body.classList.contains("chat-empty");
+        document.body.classList.remove("chat-empty");
+        if (wasSuppressed) { scrollToBottom(); }
+      }
+
+      // THE INVARIANT: once there are turns, a transcript that is hidden while
+      // Swift says the panel is `full` is a blank panel — the exact symptom
+      // reported ("sent a message, no reply on screen"). Checked after every
+      // completed turn and reported to the log, because a page-side invariant
+      // nobody can read is an invariant nobody keeps.
+      //
+      // What it will NOT do is override Swift: a `bar`/`mascot` panel is
+      // launcher-only by product rule, so hiding the transcript there is
+      // correct and is reported as such.
+      function ensureTranscriptVisible() {
+        var hasTurns = !!bubbleEl.querySelector(".turn");
+        document.body.classList.remove("chat-empty");
+        window.__popLastVisibility = "unknown";
+        if (!hasTurns) { window.__popLastVisibility = "no-content"; return "no-content"; }
+        if (getComputedStyle(bubbleEl).display !== "none") {
+          // This call is what just un-suppressed the content layer, so the scroll
+          // that the deltas could not make has to be made now.
+          scrollToBottom();
+          window.__popLastVisibility = "visible";
+          return "visible";
+        }
+        if (panelStateName !== "full") {
+          window.__popLastVisibility = "launcher-state:" + panelStateName;
+          return "launcher-state:" + panelStateName;
+        }
+        // Swift says `full`, there is content, and the transcript is hidden: the
+        // state layer and the content layer disagreed. Content wins — a finished
+        // answer is never worth less than the panel chrome.
+        document.body.classList.remove("launcher");
+        if (getComputedStyle(bubbleEl).display === "none") {
+          window.__popLastVisibility = "still-hidden";
+          return "still-hidden";
+        }
+        scrollToBottom();
+        window.__popLastVisibility = "forced-visible";
+        return "forced-visible";
+      }
+
+      // Dragging the composer BAR moves the whole launcher. A WKWebView swallows
+      // the mouse-down AppKit needs to move its window, so the bar's inert
+      // background hands the drag to Swift, which tracks the cursor itself.
+      // Interactive targets are excluded so text selection and the buttons keep
+      // working exactly as before.
+      document.getElementById("composer").addEventListener("mousedown", function (event) {
+        if (event.button !== 0) { return; }
+        // WHILE STREAMING THE BAR IS INERT. A click on the composer background
+        // used to start a window drag, which swallowed the click and stole
+        // focus while a reply was still coming in. `preventDefault` keeps the
+        // focus where it is; returning before `barDragBegin` means a stray
+        // click can do nothing at all. Not streaming: unchanged.
+        if (streaming) { event.preventDefault(); return; }
+        var target = event.target;
+        if (target && target.closest(
+          "input, button, a, textarea, select, #menu, #chips, #privacy"
+        )) { return; }
+        event.preventDefault();
+        post({ type: "barDragBegin" });
+      });
+      document.getElementById("composer").addEventListener("submit", function (event) {
+        event.preventDefault();
+        // Submit is SEND OR NOTHING. It used to double as the cancel path
+        // (`chatStop`), which is why one extra click could throw away an
+        // in-flight reply with no receipt and no feedback. Stopping is now the
+        // stop control's job alone, and it says so in the transcript.
+        if (streaming) { return; }
+        send(inputEl.value);
+      });
+      // THE EXPLICIT STOP. `stopRequested` is a distinct message type on
+      // purpose: Swift can tell "the person pressed stop" from any other
+      // teardown, which is what makes the receipt honest.
+      stopEl.addEventListener("click", function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!streaming) { return; }
+        post({ type: "stopRequested" });
+      });
+      // Tapping the strip (or Enter/Space on it — it is a real focusable
+      // element, not a styled div) expands the whole transcript.
+      function toggleConversation() {
+        // Tapping the strip OPENS THE CONVERSATION: it marks the read state and
+        // brings the newest turn into view. It used to be the only thing between
+        // the user and a 128pt window onto their own answer.
+        document.body.classList.toggle("browser-expanded");
+        scrollToBottom();
+      }
+      document.getElementById("browserStrip").addEventListener("click", toggleConversation);
+      document.getElementById("browserStrip").addEventListener("keydown", function (event) {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          toggleConversation();
+        }
+      });
+      inputEl.addEventListener("input", updateSendButton);
+      inputEl.addEventListener("focus", function () { if (menuOpen) { closeMenu(); } });
+      inputEl.addEventListener("keydown", function (event) {
+        if (event.key === "Enter" && !event.shiftKey) {
+          event.preventDefault();
+          send(inputEl.value);
+          return;
+        }
+        // Escape collapses the composer back to the robot alone.
+        if (event.key === "Escape") {
+          event.preventDefault();
+          inputEl.blur();
+          post({ type: "uiHeight", state: "mascot" });
+        }
+      });
+      plusEl.addEventListener("click", function () {
+        menuOpen ? closeMenu() : openMenu();
+      });
+      // The mic button posts and nothing else: Swift owns listening state and
+      // pushes `voiceState` back, so the visual can never desync from reality.
+      micEl.addEventListener("click", function (event) {
+        event.preventDefault();
+        post({ type: "voiceToggle" });
+      });
+      // The dialog's own controls. Its mic is the same toggle as the composer's;
+      // Send is the ONLY path a voice transcript enters the pipeline; the ×
+      // cancels without a turn.
+      voiceMicEl.addEventListener("click", function (event) {
+        event.preventDefault();
+        post({ type: "voiceToggle" });
+      });
+      voiceSendEl.addEventListener("click", function (event) {
+        event.preventDefault();
+        sendVoice();
+      });
+      voiceCloseEl.addEventListener("click", function (event) {
+        event.preventDefault();
+        cancelVoice();
+      });
+      document.getElementById("menuNewChat").addEventListener("click", function () {
+        post({ type: "newChat" });
+        inputEl.focus();
+      });
+      // There is deliberately NO sign-in item here. It used to live in this
+      // menu and did nothing visible: the browser pane is hidden unless the
+      // panel is `full`, so from the resting launcher state it navigated a page
+      // nobody could see. The account control now lives in Settings, where it
+      // opens a real key window that is on screen and takes keystrokes.
+
+      // Delegated actions: copy (incl. code-block headers), retry, context toggle.
+      document.addEventListener("click", function (event) {
+        var target = event.target;
+        if (!target) { return; }
+
+        if (target.dataset && target.dataset.copy !== undefined) {
+          var text = target.dataset.copy;
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).catch(function () {
+              target.title = "copy unavailable";
+            });
+          } else {
+            target.title = "copy unavailable";
+          }
+          return;
+        }
+        if (target.dataset && target.dataset.retry !== undefined) {
+          send(target.dataset.retry);
+          return;
+        }
+        if (target.dataset && target.dataset.key) {
+          var key = target.dataset.key;
+          var on = target.dataset.on !== "true";
+          post({ type: "contextToggle", key: key, on: on });
+          // Flip locally too so the checkmark reacts immediately; Swift is
+          // told, but the UI must not wait on a round trip.
+          chipData = chipData.map(function (c) {
+            return c.key === key ? Object.assign({}, c, { on: on }) : c;
+          });
+          renderChips();
+        }
+      });
+
+      window.addEventListener("load", function () {
+        if (!post({ type: "ping" })) { return; }
+        post({ type: "uiReady" });
+        updateSendButton();
+        inputEl.focus();
+        requireContentHeight(true);
+      });
+      // The web region's own height is decided by Swift, so a resize means the
+      // state changed and the required content height must be re-derived.
+      window.addEventListener("resize", function () { requireContentHeight(false); });
+
+      // WEDGE-PROOF NET. Any uncaught exception anywhere in this page used to
+      // leave `streaming` true, which keeps the send button in stop mode and
+      // makes the composer drop every later send before it reaches Swift — the
+      // page looked alive but was permanently deaf. Clearing the flag here
+      // means no single bug can wedge the composer. The error is still
+      // reported: this recovers state, it does not hide the fault.
+      function recoverFromFault(kind) {
+        try {
+          if (typeof setStreaming === "function") { setStreaming(false); }
+          if (typeof setStreamStatus === "function") { setStreamStatus("error", "error"); }
+          if (typeof setStatus === "function") { setStatus("error", false); }
+        } catch (ignored) { /* state is already the best we can do */ }
+      }
+      window.addEventListener("error", function (event) {
+        console.error("[pop] uncaught error", event.message, event.filename,
+          event.lineno, event.error);
+        recoverFromFault("error");
+      });
+      window.addEventListener("unhandledrejection", function (event) {
+        console.error("[pop] unhandled rejection", event.reason);
+        recoverFromFault("unhandledrejection");
+      });
+    })();
+  </script>
+</body>
+</html>

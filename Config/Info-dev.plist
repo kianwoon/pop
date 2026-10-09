@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleExecutable</key>
+  <string>Pop</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.pop.dev</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>Pop</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>26.0</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Pop uses the microphone so you can talk to your assistant.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>Pop recognizes your speech on-device to turn it into messages.</string>
+  <key>NSLocationWhenInUseUsageDescription</key>
+  <string>Pop uses your approximate location so web lookups return results for your area.</string>
+</dict>
+</plist>

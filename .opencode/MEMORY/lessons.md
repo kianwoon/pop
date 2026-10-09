@@ -1,0 +1,14 @@
+## 2026-10-08 — Never launch the TCC-gated Pop binary directly
+**Pattern:** launching `build/Pop.app/Contents/MacOS/Pop` directly (nohup/background shell) to capture stdout makes macOS TCC attribute privacy requests to the RESPONSIBLE process (the terminal/opencode), so the app SIGABRTs with "accessed privacy-sensitive data without usage description" — even though its own Info.plist HAS the strings (`VOICE_START bundled=true hasSpeech=true` in the trace proves the bundle check passed).
+**Fix:** `open build/Pop.app --stdout <file> --stderr <file>` — LaunchServices keeps TCC attribution on the bundle AND captures stdout.
+**Gate:** a mic/speech test trace must show `VOICE_LISTENING=true`; a trace dying right after `VOICE_REQ_SPEECH sent` + a TCC .ips report = wrong launch mode, not an app bug.
+## 2026-10-08 — Read the authoritative doc BEFORE inventing a wire contract
+**Pattern:** integrating an external service (jev SystemOne), I inferred the request schema from my own tool-facing shapes instead of reading the client implementation / docs that existed on this machine (~/Downloads/opencode/jev.md, plugin-lib/jev-relevance.ts). Shipped three wrong dialects; each cost a rebuild + user token re-paste. Live 400s were diagnosable all along: the service returns SchemaError detail on valid auth, generic api_usage_error on body rejection.
+**Rule:** for ANY external API integration: (1) locate the authoritative doc or a working client source on disk first; (2) reproduce the service's validation order with an unauthenticated curl (auth-vs-body error codes discriminate); (3) never map fields by intuition.
+**Gate:** integration ships only with a probe asserting the documented request shape field-for-field + refusal-body logging.
+## 2026-10-08 — Batch-diagnose agent-pipeline failures from ONE trace pass
+**Pattern:** the LinkedIn "simple use case" took hours because five stacked broken links (jev dialect 400, wrong-surface extract, first-match tab focus, silent round-cap, missing tab identity) were fixed ONE PER USER TEST — each cycle costing a rebuild + Keychain token re-paste + user retest.
+**Rule:** when a multi-link pipeline fails, pull the full trace ONCE and diagnose every link in the same pass; fix all diagnosed links in one batch; then one rebuild + one retest. A trace that shows three anomalies yields three fixes, not three sessions.
+**Gate:** before handing any fix back for retest, re-grep the same trace for the next anomaly — if one exists, it goes in the same batch.
+- date: 2026-10-09
+  lesson: Direct-exec of a signed .app binary (nohup MacOS/Pop &) breaks TCC attribution — macOS SIGABRTs on privacy-gated APIs even with intact Info.plist keys. Relaunch via 'open -n App.app --stdout f --stderr f' (LaunchServices identity + captured stdout). Verify launch method first on TCC-vs-plist contradictions.

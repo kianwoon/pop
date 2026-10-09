@@ -1,0 +1,12 @@
+build/
+.build/
+*.xcodeproj/
+# Pop.xcodeproj IS a source artifact: it is the only build path that signs the
+# app, so it must be committed. The rule above exists to keep scratch
+# projects out, not to exclude this one.
+!Pop.xcodeproj/
+.DS_Store
+pop-transcript*.log
+*.log
+graphify-out/
+.swiftpm/
