@@ -186,6 +186,11 @@ enum Observe {
     }
 
     static func axExcerpt(bundleID: String) -> (lines: [String], state: Observation.AXState) {
+        // THE PRODUCTION SEAM. Every excerpt — the summon snapshot AND the
+        // screen context — also turns on Chromium's page-content tree, so an
+        // excerpt is never a skeleton on a Chromium app Pop is actually
+        // observing. Idempotent; logs OBS_AX_MANUAL.
+        enableManualAXIfChromium(bundleID: bundleID)
         guard let app = axApplication(bundleID: bundleID) else {
             return ([], .denied)
         }

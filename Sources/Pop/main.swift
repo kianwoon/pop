@@ -257,6 +257,13 @@ func bootstrap() {
         return
     }
 
+    // `--test-pid-click`: the cursorless pid-click construction, asserted by the
+    // button's ACTION firing, not by the post returning.
+    if CommandLine.arguments.contains("--test-pid-click") {
+        runPidClickProbe()
+        return
+    }
+
     // The browser probes share one fixture root and a live WKWebView, so they
     // run on the app path (a run loop is required) but never touch the network:
     // every URL is a `file://`-backed fixture opened through a loopback-safe
@@ -1693,6 +1700,107 @@ private func runBrowserActionsProbe() {
 
     DispatchQueue.main.asyncAfter(deadline: .now() + 90) {
         print("ACTIONS_TIMEOUT")
+        fflush(stdout)
+        exit(1)
+    }
+    NSApp.run()
+}
+
+/// The pid-click probe's button target: bumping a counter is the whole action.
+/// A real `@objc` action, so the probe asserts the EFFECT (the action fired),
+/// never that an event was merely posted.
+@MainActor
+private final class PidClickCounter: NSObject {
+    var value = 0
+    @objc func bump(_ sender: Any?) { value += 1 }
+}
+
+/// `--test-pid-click`: THE CURSORLESS CLICK, asserted by EFFECT.
+///
+/// The probe stands up its OWN borderless window with a button whose action
+/// bumps a counter, resolves that window through `CGWindowList` (the same lookup
+/// shape as `clickTargetWindow`, but INCLUDING own pid — `postClickToWindow` is
+/// called directly, bypassing `click`'s own-process exclusion), pid-clicks the
+/// button's centre, pumps the run loop, and asserts the counter incremented.
+/// A posted-but-dropped event (the Brave double-miss) FAILS here, because the
+/// assertion is the action, not the post.
+@MainActor
+private func runPidClickProbe() {
+    _ = NSApplication.shared
+    NSApp.setActivationPolicy(.regular)
+
+    let counter = PidClickCounter()
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 320, height: 160),
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    let button = NSButton(frame: NSRect(x: 100, y: 60, width: 120, height: 40))
+    button.title = "poke"
+    button.bezelStyle = .rounded
+    button.target = counter
+    button.action = #selector(PidClickCounter.bump(_:))
+    window.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 160))
+    window.contentView?.addSubview(button)
+    window.center()
+    window.makeKeyAndOrderFront(nil)
+    NSApp.activate()
+
+    Task { @MainActor in
+        // Let AppKit realize the window and assign its CGWindowID.
+        try? await Task.sleep(for: .milliseconds(300))
+
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        let buttonInWindow = button.convert(button.bounds, to: nil)
+        let buttonOnScreen = window.convertToScreen(buttonInWindow)
+        let quartzPoint = CGPoint(
+            x: buttonOnScreen.midX,
+            y: primaryHeight - buttonOnScreen.midY
+        )
+
+        // Resolve our OWN window through CGWindowList — same shape as
+        // `clickTargetWindow`, but including our pid.
+        let ownPid = ProcessInfo.processInfo.processIdentifier
+        var resolved: (pid: pid_t, windowNumber: Int, bounds: CGRect)?
+        if let list = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+        ) as? [[String: Any]] {
+            for info in list {
+                guard let owner = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                      owner == ownPid,
+                      let number = (info[kCGWindowNumber as String] as? NSNumber)?.intValue,
+                      let boundsRaw = info[kCGWindowBounds as String] as? [String: Any],
+                      let bounds = CGRect(dictionaryRepresentation: boundsRaw as CFDictionary),
+                      bounds.contains(quartzPoint)
+                else { continue }
+                resolved = (owner, number, bounds)
+                break
+            }
+        }
+        guard let target = resolved else {
+            print("PID_CLICK_GATE=false reason=no-window")
+            fflush(stdout)
+            exit(1)
+        }
+
+        let posted = BrowserActions.postClickToWindow(
+            pid: target.pid, windowNumber: target.windowNumber,
+            at: quartzPoint, windowBounds: target.bounds
+        )
+
+        // Pump ~1s for delivery + the button action to fire.
+        try? await Task.sleep(for: .seconds(1))
+
+        let gate = counter.value == 1
+        print("PID_CLICK_GATE=\(gate)")
+        print("PID_CLICK_POSTED=\(posted) count=\(counter.value)")
+        fflush(stdout)
+        exit(gate ? 0 : 1)
+    }
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
+        print("PID_CLICK_GATE=false reason=timeout")
         fflush(stdout)
         exit(1)
     }

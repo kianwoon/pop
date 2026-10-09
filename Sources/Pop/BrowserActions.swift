@@ -66,6 +66,15 @@ enum BrowserActions {
     /// go to `.cghidEventTap`.
     static var eventSinkOverride: (@Sendable (CGEvent) -> Void)?
 
+    /// Whether this act should drive the ghost cursor and restore the user's
+    /// pointer: off the probe sink (a probe must not warp the developer's REAL
+    /// cursor; the real-CGEvent arm clears the sink, so `VirtualCursor.isEnabled`
+    /// is the second gate) and only when the ghost is enabled. One seam, so a
+    /// future mouse act reusing this funnel cannot silently skip ghost+restore.
+    fileprivate static var shouldGhost: Bool {
+        eventSinkOverride == nil && VirtualCursor.isEnabled
+    }
+
     /// What to do with an already-open browser tab before opening a URL.
     ///
     /// WHY: the `open` command ALWAYS opens a new tab, so asking Pop to show a
@@ -402,6 +411,56 @@ enum BrowserActions {
                 """
         }
 
+        // PID-FIRST CLICK. The zero-interference path: post the click straight
+        // into the target process (CGEventPostToPid), so it reaches
+        // NSWindow.sendEvent() with NO cursor movement and NO focus change. The
+        // HID+ghost path below stays intact as the FALLBACK — one code path, one
+        // funnel. Probes (including the real-CGEvent arm that clears the sink)
+        // never pid-post, so probe bytes stay identical.
+        let isProbeRun = CommandLine.arguments.contains {
+            $0.hasPrefix("--test-") || $0.hasPrefix("--user-")
+        }
+        if eventSinkOverride == nil, !isProbeRun,
+           ProcessInfo.processInfo.environment["POP_PID_CLICK"] != "0" {
+            if let target = clickTargetWindow(at: point) {
+                // The ghost is Pop's visible cursor regardless of mechanism.
+                if shouldGhost { await MainActor.run { VirtualCursor.move(to: point) } }
+                if postClickToWindow(
+                    pid: target.pid, windowNumber: target.windowNumber,
+                    at: point, windowBounds: target.bounds
+                ) {
+                    if shouldGhost {
+                        await MainActor.run { VirtualCursor.clickPulse(at: point) }
+                        await MainActor.run { VirtualCursor.end() }
+                    }
+                    print("UI_ACTION click pid \(target.pid) window \(target.windowNumber) \(x),\(y)")
+                    fflush(stdout)
+                    return """
+                        click: posted one cursorless left click at (\(x), \(y)) — the \
+                        user's pointer did not move. Note: some apps (notably \
+                        Chromium-based ones in the background) ignore or drop \
+                        process-targeted events, so if the effect did not land, \
+                        retry with POP_PID_CLICK=0 or verify first with screen_read.
+                        """
+                }
+                print("PID_CLICK_FALLBACK reason=post-failed")
+                fflush(stdout)
+            } else {
+                print("PID_CLICK_FALLBACK reason=no-window")
+                fflush(stdout)
+            }
+        }
+
+        // Ghost cursor: announce the act, then return the user's pointer.
+        // `shouldGhost` holds the probe gate (see its comment).
+        var savedCursor: CGPoint?
+        if shouldGhost {
+            // Quartz top-left, the same space as x/y; nil skips the restore.
+            savedCursor = CGEvent(source: nil)?.location
+            // Lead the act: the ghost arrives before the burst does.
+            await MainActor.run { VirtualCursor.move(to: point) }
+        }
+
         // Move, press, release. A click with no preceding mouseMoved lands on
         // whatever the pointer was already over on some system paths.
         let source = CGEventSource(stateID: .combinedSessionState)
@@ -414,6 +473,35 @@ enum BrowserActions {
                     mouseCursorPosition: point, mouseButton: .left)
         ]
         post(events.compactMap { $0 })
+
+        if shouldGhost {
+            await MainActor.run { VirtualCursor.clickPulse(at: point) }
+
+            // Return the user's pointer. The warp ALONE races: CGEventPost
+            // delivery is async, so it can execute before the HID system drains
+            // the burst — whose mouseMoved then lands LAST and leaves the cursor
+            // at the target. Events posted to the SAME tap are delivered IN
+            // ORDER, so queue a restore mouseMoved through the same funnel; it
+            // lands after the burst and wins regardless of delivery latency. The
+            // warp is kept as the immediate-path correction for the case the
+            // burst already drained — every interleaving of (queued burst,
+            // queued restore, warp) ends with the cursor at the saved position.
+            // The restore re-asserts the pre-act hover (the pointer was already
+            // there), so it disturbs nothing.
+            if let savedCursor {
+                if let restore = CGEvent(
+                    mouseEventSource: source, mouseType: .mouseMoved,
+                    mouseCursorPosition: savedCursor, mouseButton: .left
+                ) {
+                    post([restore])
+                }
+                CGWarpMouseCursorPosition(savedCursor)
+                CGAssociateMouseAndMouseCursorPosition(1)
+                print("GHOST_CURSOR saved=\(savedCursor.x),\(savedCursor.y)")
+                fflush(stdout)
+            }
+            await MainActor.run { VirtualCursor.end() }
+        }
 
         print("UI_ACTION click \(x),\(y)")
         fflush(stdout)
@@ -432,6 +520,151 @@ enum BrowserActions {
             return
         }
         for event in events { event.post(tap: .cghidEventTap) }
+    }
+
+    /// The routable target for a pid-first click: which process, which window,
+    /// and that window's Quartz-global bounds (top-left origin).
+    fileprivate struct PidClickTarget {
+        let pid: pid_t
+        let windowNumber: Int
+        let bounds: CGRect
+    }
+
+    /// The topmost on-screen window whose bounds contain `point`, EXCLUDING
+    /// Pop's own process — the same spirit as `visibleWindowBounds`, which never
+    /// returns Pop's panel. Quartz list order is front-to-back, so the first
+    /// match is the topmost. `nil` means nothing routable (desktop, Pop's own
+    /// panel, locked-down window) and the caller falls back to HID+ghost.
+    fileprivate static func clickTargetWindow(at point: CGPoint) -> PidClickTarget? {
+        guard let list = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+        ) as? [[String: Any]] else { return nil }
+        let ownPid = ProcessInfo.processInfo.processIdentifier
+        for info in list {
+            guard let owner = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                  owner != ownPid,
+                  let number = (info[kCGWindowNumber as String] as? NSNumber)?.intValue,
+                  // Normal windows only (layer 0): the desktop, menu bar, and
+                  // other chrome are not click targets.
+                  (info[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0 == 0,
+                  let boundsRaw = info[kCGWindowBounds as String] as? [String: Any],
+                  let bounds = CGRect(dictionaryRepresentation: boundsRaw as CFDictionary),
+                  bounds.contains(point)
+            else { continue }
+            return PidClickTarget(pid: owner, windowNumber: number, bounds: bounds)
+        }
+        return nil
+    }
+
+    /// Best-effort handle to the PRIVATE `CGEventSetWindowLocation` that
+    /// ghostpoke loads via `dlsym` (CoreGraphics does not export it in a header).
+    /// `nil` when the symbol is absent — then the window-local point is simply
+    /// not set, exactly ghostpoke's own best-effort behavior.
+    private static let windowLocationSetter: (@convention(c) (UnsafeMutableRawPointer?, CGPoint) -> Void)? = {
+        let paths = [
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        ]
+        for path in paths {
+            guard let handle = dlopen(path, RTLD_LAZY) else { continue }
+            if let symbol = dlsym(handle, "CGEventSetWindowLocation") {
+                return unsafeBitCast(
+                    symbol,
+                    to: (@convention(c) (UnsafeMutableRawPointer?, CGPoint) -> Void).self
+                )
+            }
+        }
+        return nil
+    }()
+
+    /// Link-bearing browser bundle-id prefixes (hasPrefix match, the same idiom
+    /// as `Observe.isChromium`). These get a CLEAN click — never the background
+    /// Command mask, which in a link UI IS cmd+click = open-in-new-tab.
+    private static let browserBundleIDPrefixes = [
+        "com.brave.Browser",
+        "com.google.Chrome",
+        "com.microsoft.edgemac",
+        "com.chromium.Chromium",
+        "org.mozilla.firefox",
+        "com.apple.Safari"
+    ]
+
+    /// Post a left down+up straight into `pid`'s queue via `CGEventPostToPid`,
+    /// bound to `windowNumber`. FAITHFUL PORT of `ghostpoke_probe.py`'s click
+    /// path (`_post_click` + `_apply_fields`) — the field set is LOAD-BEARING,
+    /// measured, not decorative: posting only fields 91/92 + the global location
+    /// POSTED OK but was DROPPED (two clicks on Brave window 3396 left
+    /// `screen_read` unchanged, 4933→4935 bytes). The full recipe writes FOUR
+    /// integer fields (button 3, subtype 7, window 91/92), the global location,
+    /// AND the window-local location.
+    ///
+    /// The event never passes through the shared cursor, so the user's pointer
+    /// does not move. Returns true once both events are constructed and posted.
+    static func postClickToWindow(
+        pid: pid_t, windowNumber: Int, at point: CGPoint, windowBounds: CGRect
+    ) -> Bool {
+        // WHAT THE PYTHON DOES: it derives the window-local point as
+        // `screen - windowOrigin` (Quartz top-left space, NO y-flip) and feeds
+        // that to NSEvent.mouseEvent — mirrored exactly here, even though
+        // AppKit's documented contract calls for window-BASE (bottom-left)
+        // coords. Both the global and the local point are set because the
+        // receiver's hit-test reads the local point while routing reads the
+        // global one.
+        let local = CGPoint(
+            x: point.x - windowBounds.minX,
+            y: point.y - windowBounds.minY
+        )
+        let timestamp = ProcessInfo.processInfo.systemUptime
+        let seed = Int(timestamp * 1_000_000) & 0x7FFF_FFFF
+        func make(_ type: NSEvent.EventType, eventNumber: Int) -> CGEvent? {
+            NSEvent.mouseEvent(
+                with: type, location: local, modifierFlags: [], timestamp: timestamp,
+                windowNumber: windowNumber, context: nil, eventNumber: eventNumber,
+                clickCount: 1, pressure: 1.0
+            )?.cgEvent
+        }
+        guard let down = make(.leftMouseDown, eventNumber: seed),
+              let up = make(.leftMouseUp, eventNumber: seed + 1) else { return false }
+        // ghostpoke sets kCGEventFlagMaskCommand when the target is not the
+        // active app — the trick that makes background apps accept the event at
+        // all. But in a link-bearing UI that flag IS cmd+click: it opens a new
+        // tab instead of clicking. So browsers always get a CLEAN click — a
+        // dropped event is caught by the brain's screen_read verify and retried,
+        // whereas a wrong-tab open is not. Resolve the bundle id ONCE.
+        let target = NSRunningApplication(processIdentifier: pid)
+        let targetIsActive = target?.isActive ?? false
+        let targetBundleID = target?.bundleIdentifier ?? ""
+        let isLinkBearingBrowser = browserBundleIDPrefixes.contains {
+            targetBundleID.hasPrefix($0)
+        }
+        let shouldMask = !targetIsActive && !isLinkBearingBrowser
+        // A missing private setter must not degrade SILENTLY (still best-effort).
+        if windowLocationSetter == nil {
+            print("PID_CLICK_NO_SETTER=1")
+            fflush(stdout)
+        }
+        for event in [down, up] {
+            // Field 3 = kCGMouseEventButtonNumber (0 = left).
+            event.setIntegerValueField(.mouseEventButtonNumber, value: 0)
+            // Field 7 = kCGMouseEventSubtype (ghostpoke's default 3).
+            event.setIntegerValueField(.mouseEventSubtype, value: 3)
+            // Fields 91/92 = the window-routing pointers.
+            event.setIntegerValueField(
+                .mouseEventWindowUnderMousePointer, value: Int64(windowNumber)
+            )
+            event.setIntegerValueField(
+                .mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: Int64(windowNumber)
+            )
+            // Global location (CGEventSetLocation) AND the private window-local
+            // setter — the Python sets both.
+            event.location = point
+            if shouldMask { event.flags = .maskCommand }
+            if let setter = windowLocationSetter {
+                setter(Unmanaged.passUnretained(event).toOpaque(), local)
+            }
+            event.postToPid(pid)
+        }
+        return true
     }
 
     // MARK: - ui_type
@@ -883,7 +1116,24 @@ enum UIAct {
             }
         }
 
-        guard let found = findFrontElement(title: needle) else {
+        // Enable Chromium's page-content tree on the FRONTMOST app at ACT time:
+        // ui_ax can run before any excerpt, so the title path must not rely on
+        // axExcerpt having enabled it.
+        Observe.enableManualAXIfChromium(bundleID: Observe.frontmostApp().bundleID)
+
+        // A freshly enabled Chromium tree materializes ASYNCHRONOUSLY — one
+        // immediate find is not a verdict. Poll up to 5 attempts over ~2s (the
+        // materialization window) before giving up.
+        func findWithMaterialization(_ needle: String)
+            async -> (role: String, title: String, element: AXUIElement)? {
+            for attempt in 0..<5 {
+                if let found = findFrontElement(title: needle) { return found }
+                if attempt < 4 { try? await Task.sleep(nanoseconds: 400_000_000) }
+            }
+            return nil
+        }
+
+        guard let found = await findWithMaterialization(needle) else {
             return """
                 ERROR: no accessibility element whose title or description \
                 contains '\(needle)' in the frontmost app \

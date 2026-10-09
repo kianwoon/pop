@@ -997,7 +997,55 @@ final class ChatController {
             // already chosen, where a hands-on route could only be injected as a
             // hint line and never acted on. See `resolveProvider`'s promotion.
             let routeChoice = await Self.turnRouteChoice(config: config, messages: turnMessages)
-            let choice = Self.resolveProvider(config, route: routeChoice)
+            let resolved = Self.resolveProvider(config, route: routeChoice)
+            // PRE-FLIGHT BUDGET CHECK. The on-device model can blow its context
+            // window MID-TURN — the stack grows with prefix + schemas +
+            // observation + history + tool results — which the user feels as a
+            // long stall before the mid-turn fallback. Estimate the prompt here
+            // and, when it arithmetically cannot fit, divert to the cloud
+            // BEFORE any on-device call. Keyed on the AppleFM TYPE so probe
+            // ScriptedProviders are never diverted (byte-identical).
+            //
+            // Rough estimate: chars/4 is the usual English chars-per-token
+            // heuristic (±20%). Message text + ~16 chars/msg role framing, the
+            // FM system prompt (it rides every on-device turn), plus the tool
+            // schemas (name + description + a flat 400/tool allowance for
+            // parameters). The 400/tool is MEASURED: the registry is ≈4,779
+            // tokens pruned (≈400/tool with params). Over-estimating is the SAFE
+            // direction — it diverts earlier; under-estimating is the failure
+            // mode this gate exists to stop.
+            let messageChars = turnMessages.reduce(0) { $0 + $1.text.count + 16 }
+            let systemChars = AppleFMProvider.systemPrompt.count
+            let schemaChars = toolSchemas.reduce(0) {
+                $0 + $1.name.count + $1.description.count + 400
+            }
+            let estTokens = (messageChars + schemaChars + systemChars) / 4
+            let window = AppleFMProvider.contextWindowSize()
+            var preflightDecision = "on-device"
+            // Built as a `var` then frozen into `choice` (a `let`), so the
+            // concurrently-executing closures below capture an immutable value.
+            var diverted = resolved
+            // 85% headroom: a prompt at the full window leaves no budget to emit
+            // the answer itself.
+            if resolved.primary is AppleFMProvider,
+               let factory = resolved.fallbackFactory,
+               estTokens > window * 85 / 100 {
+                diverted.primary = factory()
+                // A cloud primary has no cloud failure mode to rescue, so drop
+                // the same-builder fallback: keeping it would print the wrong
+                // "On-device did not answer" and spawn a phantom second cloud
+                // provider on an empty carry.
+                diverted.fallbackFactory = nil
+                // Reuse the remote-routing decision so the EXISTING notice site
+                // below renders it — same plumbing as a promoted route.
+                diverted.decision = "remote-routing"
+                diverted.notice = "Turn too large for the on-device brain "
+                    + "(est \(estTokens) of \(window) tokens) \u{2014} using the cloud"
+                preflightDecision = "cloud"
+            }
+            print("FM_PREFLIGHT est=\(estTokens) budget=\(window) decision=\(preflightDecision)")
+            fflush(stdout)
+            let choice = diverted
             // Ready to answer if the primary is healthy OR a fallback exists to
             // catch it. An unhealthy primary with NO fallback is a dead end, and a
             // dead end must say so — visibly, not as an empty panel.
